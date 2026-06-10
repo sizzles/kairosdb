@@ -60,6 +60,7 @@ async fn write_query_delete_roundtrip() {
             end_time_ms: t1 + 10_000,
             tags: HashMap::new(),
             limit: None,
+            descending: false,
         })
         .await
         .expect("query");
@@ -92,6 +93,7 @@ async fn write_query_delete_roundtrip() {
             end_time_ms: t1 + 10_000,
             tags: HashMap::from([("root".to_string(), vec!["CL".to_string()])]),
             limit: None,
+            descending: false,
         })
         .await
         .expect("bounded query");
@@ -106,6 +108,7 @@ async fn write_query_delete_roundtrip() {
             end_time_ms: t1 + 10_000,
             tags: HashMap::from([("root".to_string(), vec!["CL".to_string()])]),
             limit: None,
+            descending: false,
         })
         .await
         .expect("delete");
@@ -116,6 +119,7 @@ async fn write_query_delete_roundtrip() {
             end_time_ms: t1 + 10_000,
             tags: HashMap::from([("root".to_string(), vec!["CL".to_string()])]),
             limit: None,
+            descending: false,
         })
         .await
         .expect("query after delete");

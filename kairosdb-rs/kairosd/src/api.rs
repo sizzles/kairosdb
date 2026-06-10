@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -27,8 +27,13 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/v1/version", get(version))
         .route("/api/v1/metricnames", get(metric_names))
-        .route("/api/v1/datapoints", post(add_datapoints))
+        .route("/api/v1/datapoints", post(add_datapoints).put(add_datapoints))
         .route("/api/v1/datapoints/query", post(query_datapoints))
+        .route("/api/v1/datapoints/query/tags", post(query_metric_tags))
+        .route("/api/v1/datapoints/delete", post(delete_datapoints))
+        .route("/api/v1/metric/{name}", delete(delete_metric))
+        .route("/api/v1/health/check", get(health_check))
+        .route("/api/v1/health/status", get(health_status))
         .route("/api/v1/rollups", post(create_rollup).get(list_rollups))
         .route(
             "/api/v1/rollups/{id}",
@@ -55,10 +60,18 @@ async fn version() -> Json<JsonValue> {
     Json(json!({ "version": concat!("KairosDB-rs ", env!("CARGO_PKG_VERSION")) }))
 }
 
-async fn metric_names(State(state): State<AppState>) -> Result<Json<JsonValue>, ApiError> {
+#[derive(serde::Deserialize, Default)]
+struct MetricNamesParams {
+    prefix: Option<String>,
+}
+
+async fn metric_names(
+    State(state): State<AppState>,
+    Query(params): Query<MetricNamesParams>,
+) -> Result<Json<JsonValue>, ApiError> {
     let names = state
         .store
-        .metric_names(None)
+        .metric_names(params.prefix.as_deref())
         .await
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(json!({ "results": names })))
@@ -66,12 +79,26 @@ async fn metric_names(State(state): State<AppState>) -> Result<Json<JsonValue>, 
 
 /// Ingest format: an array of metric objects (a single object is also
 /// accepted), each carrying `tags` plus either `datapoints: [[ts, value]]`
-/// or a single `timestamp`/`value` pair. Sets are acknowledged once durable
-/// in the WAL and queued, not once stored.
+/// or a single `timestamp`/`value` pair. The body may be gzip-compressed
+/// (`Content-Encoding: gzip`), as the Java server accepts. Sets are
+/// acknowledged once durable in the WAL and queued, not once stored.
 async fn add_datapoints(
     State(state): State<AppState>,
-    Json(body): Json<JsonValue>,
+    headers: axum::http::HeaderMap,
+    raw_body: axum::body::Bytes,
 ) -> Result<StatusCode, ApiError> {
+    let gzipped = headers
+        .get(axum::http::header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("gzip"));
+    let body: JsonValue = if gzipped {
+        let mut decoder = flate2::read::GzDecoder::new(raw_body.as_ref());
+        serde_json::from_reader(&mut decoder)
+            .map_err(|e| bad_request(format!("invalid gzip json: {e}")))?
+    } else {
+        serde_json::from_slice(&raw_body).map_err(|e| bad_request(format!("invalid json: {e}")))?
+    };
+
     let metrics: Vec<&JsonValue> = match &body {
         JsonValue::Array(items) => items.iter().collect(),
         JsonValue::Object(_) => vec![&body],
@@ -158,13 +185,15 @@ fn parse_value(value: &JsonValue) -> Result<Value, ApiError> {
 }
 
 /// Datastore fetch + group/aggregate pipeline for one metric query; shared
-/// between the query endpoint and the rollup executor.
+/// between the query endpoint and the rollup executor. The third element is
+/// the series produced by `save_as` aggregators, which the caller must
+/// submit to ingest.
 pub(crate) async fn run_metric_query(
     store: &AnyDatastore,
     metric: &MetricQuery,
     start_ms: i64,
     end_ms: i64,
-) -> Result<(usize, Vec<GroupResult>), String> {
+) -> Result<(usize, Vec<GroupResult>, Vec<DataPointSet>), String> {
     let series = store
         .query(&DatastoreQuery {
             metric: metric.name.clone(),
@@ -172,6 +201,7 @@ pub(crate) async fn run_metric_query(
             end_time_ms: end_ms,
             tags: metric.tag_filter(),
             limit: metric.limit,
+            descending: metric.descending(),
         })
         .await
         .map_err(|e| e.to_string())?;
@@ -182,9 +212,9 @@ pub(crate) async fn run_metric_query(
         .map(|s| SeriesInput { tags: s.tags, points: s.points })
         .collect();
 
-    let groups =
-        kairos_query::model::execute(metric, inputs, start_ms).map_err(|e| e.to_string())?;
-    Ok((sample_size, groups))
+    let (groups, saved) = kairos_query::model::execute(metric, inputs, start_ms, end_ms)
+        .map_err(|e| e.to_string())?;
+    Ok((sample_size, groups, saved))
 }
 
 async fn query_datapoints(
@@ -198,9 +228,17 @@ async fn query_datapoints(
 
     let mut queries = Vec::new();
     for metric in &request.metrics {
-        let (sample_size, groups) = run_metric_query(&state.store, metric, start_ms, end_ms)
-            .await
-            .map_err(bad_request)?;
+        let (sample_size, groups, saved) =
+            run_metric_query(&state.store, metric, start_ms, end_ms)
+                .await
+                .map_err(bad_request)?;
+        for set in saved {
+            state
+                .ingest
+                .submit(set)
+                .await
+                .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        }
 
         let results: Vec<JsonValue> = groups
             .into_iter()
@@ -220,6 +258,111 @@ async fn query_datapoints(
     }
 
     Ok(Json(json!({ "queries": queries })))
+}
+
+/// `POST /api/v1/datapoints/query/tags`: same query JSON, but returns only
+/// the matching series' tag sets (used by Grafana's tag pickers).
+async fn query_metric_tags(
+    State(state): State<AppState>,
+    Json(request): Json<QueryRequest>,
+) -> Result<Json<JsonValue>, ApiError> {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let (start_ms, end_ms) = request
+        .resolve_time_range(now_ms)
+        .map_err(|e| bad_request(e.to_string()))?;
+
+    let mut results = Vec::new();
+    for metric in &request.metrics {
+        let series = state
+            .store
+            .query(&DatastoreQuery {
+                metric: metric.name.clone(),
+                start_time_ms: start_ms,
+                end_time_ms: end_ms,
+                tags: metric.tag_filter(),
+                limit: None,
+                descending: false,
+            })
+            .await
+            .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        let mut tags: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        for s in &series {
+            for (k, v) in &s.tags {
+                let values = tags.entry(k.clone()).or_default();
+                if !values.contains(v) {
+                    values.push(v.clone());
+                }
+            }
+        }
+        results.push(json!({"name": metric.name, "tags": tags}));
+    }
+    Ok(Json(json!({ "queries": [{ "results": results }] })))
+}
+
+/// `POST /api/v1/datapoints/delete`: same query JSON; removes the matching
+/// points.
+async fn delete_datapoints(
+    State(state): State<AppState>,
+    Json(request): Json<QueryRequest>,
+) -> Result<StatusCode, ApiError> {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let (start_ms, end_ms) = request
+        .resolve_time_range(now_ms)
+        .map_err(|e| bad_request(e.to_string()))?;
+    for metric in &request.metrics {
+        state
+            .store
+            .delete(&DatastoreQuery {
+                metric: metric.name.clone(),
+                start_time_ms: start_ms,
+                end_time_ms: end_ms,
+                tags: metric.tag_filter(),
+                limit: None,
+                descending: false,
+            })
+            .await
+            .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `DELETE /api/v1/metric/{name}`: removes every point of the metric.
+async fn delete_metric(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .store
+        .delete(&DatastoreQuery {
+            metric: name,
+            start_time_ms: i64::MIN,
+            end_time_ms: i64::MAX,
+            tags: Default::default(),
+            limit: None,
+            descending: false,
+        })
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /api/v1/health/check`: 204 when the datastore answers, 500 when not
+/// (the Java `HealthCheckResource` contract).
+async fn health_check(State(state): State<AppState>) -> StatusCode {
+    match state.store.metric_names(Some("\u{0}")).await {
+        Ok(_) => StatusCode::NO_CONTENT,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+/// `GET /api/v1/health/status`: the Java "Name: OK/FAIL" string array.
+async fn health_status(State(state): State<AppState>) -> Json<JsonValue> {
+    let datastore = match state.store.metric_names(Some("\u{0}")).await {
+        Ok(_) => "Datastore-Query: OK",
+        Err(_) => "Datastore-Query: FAIL",
+    };
+    Json(json!([datastore, "Ingest-Queue: OK"]))
 }
 
 impl From<RollupError> for ApiError {
@@ -275,7 +418,7 @@ fn value_pair(point: &DataPoint) -> JsonValue {
         Value::Long(v) => json!(v),
         Value::Double(v) => json!(v),
         Value::Text(s) => json!(s.as_ref()),
-        Value::Custom { .. } => JsonValue::Null,
+        Value::Null | Value::Custom { .. } => JsonValue::Null,
     };
     json!([point.timestamp_ms, value])
 }

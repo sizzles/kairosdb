@@ -11,8 +11,8 @@ with commodity-market-data extensions to follow.
 |---|---|
 | `kairos-core` | Data model (`Value`, `DataPoint`, `DataPointSet`), the zig-zag varint value codec (byte-compatible with `org.kairosdb.util.Util`), time units and the `RangeAggregator` bucketing math |
 | `kairos-store` | `Datastore` trait, in-memory backend, the **WAL** (segmented, CRC-checked, checkpointed), and the **Cassandra backend** (`scylla` driver, concurrent reads, batched writes) using the Java schema: `data_points`, `row_keys`, `row_key_time_index`, `string_index`, `spec` |
-| `kairos-query` | Range-aggregation engine; aggregators `sum`, `avg`, `min`, `max`, `count`, `dev`, `percentile`, `first`, `last`, `scale`, `div`, `diff`, `rate`, `sma`, `filter`, `trim`; group-bys `tag`, `time`, `value`, `bin`; wire-compatible query JSON model |
-| `kairosd` | Server binary: `/api/v1` REST endpoints (`datapoints`, `datapoints/query`, `metricnames`, `rollups`, `version`) on axum; durable ingest pipeline (WAL → queue → batched writes, replay on restart); rollup scheduler |
+| `kairos-query` | Range-aggregation engine; all 23 Java aggregators (`sum`, `avg`, `min`, `max`, `count`, `dev`, `percentile`, `first`, `last`, `scale`, `div`, `diff`, `rate`, `sma`, `filter`, `trim`, `pad`, `gaps`, `least_squares`, `sampler`, `score`, `time_diff`, `save_as`); group-bys `tag`, `time`, `value`, `bin`; `order: desc`; wire-compatible query JSON model |
+| `kairosd` | Server binary: `/api/v1` REST endpoints (`datapoints` incl. gzip, `datapoints/query`, `datapoints/query/tags`, `datapoints/delete`, `metric/{name}` delete, `metricnames?prefix=`, `health/check`, `health/status`, `rollups`, `version`) on axum; durable ingest pipeline (WAL → queue → batched writes, replay on restart); rollup scheduler |
 
 ## Verified storage-level interop with Java KairosDB
 
@@ -26,9 +26,11 @@ implementation (1.4.0-SNAPSHOT) running on the same Cassandra 4.1 keyspace:
 
 Row-key blobs, column-time encoding (legacy and modern), value encodings, and
 the `spec`-table row-format negotiation all match `ClusterConnection` /
-`CQLBatch` semantics. Aggregator results (`percentile`, `dev`, `sma`, `rate`,
-`max`, …) and `time` group-by output were verified bit-identical between the
-two servers on shared data.
+`CQLBatch` semantics. The full aggregator set, `time` group-by output,
+descending order with limit, `query/tags`, `save_as` write-back, and
+cross-server deletes are verified against the Java server by the
+[regression suite](regression/README.md) — run it any time both servers
+share a Cassandra keyspace.
 
 ## Performance (same box, same single-node Cassandra 4.1, 100k points)
 
@@ -82,8 +84,11 @@ curl -X POST localhost:8080/api/v1/datapoints/query -d '{
 
 ## Not here yet (see the proposal)
 
-Telnet ingest, the remaining niche aggregators (`least_squares`, `sampler`,
-`save_as`, `gaps`, `limit`), per-query time zones (calendar math is
-UTC-only), distributed rollup assignment (rollups are single-node), legacy
-(pre-1.1) value decoding, and the `kairos-commodity` crate (reference data,
-OHLCV values, curve queries, continuous contracts).
+Telnet ingest, per-query time zones (calendar math is UTC-only), the
+`/api/v1/features` and metadata/service APIs, distributed rollup assignment
+(rollups are single-node), legacy (pre-1.1) value decoding, and the
+`kairos-commodity` crate (reference data, OHLCV values, curve queries,
+continuous contracts). Known divergences: `percentile` is exact instead of
+reservoir-sampled past 1028 points; `rate`/`sampler` drop equal-timestamp
+pairs instead of erroring; descending queries aggregate ascending and
+reverse the output.

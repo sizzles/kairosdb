@@ -186,9 +186,12 @@ impl RollupManager {
                 .map_err(|e| e.to_string())?;
 
             for metric in &request.metrics {
-                let (_, groups) = run_metric_query(&self.store, metric, start_ms, end_ms)
+                let (_, groups, saved) = run_metric_query(&self.store, metric, start_ms, end_ms)
                     .await
                     .map_err(|e| e.to_string())?;
+                for set in saved {
+                    self.ingest.submit(set).await.map_err(|e| e.to_string())?;
+                }
                 for group in groups {
                     if group.points.is_empty() {
                         continue;

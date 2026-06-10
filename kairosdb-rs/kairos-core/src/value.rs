@@ -18,6 +18,7 @@ pub const DST_LONG: &str = "kairos_long";
 pub const DST_DOUBLE: &str = "kairos_double";
 pub const DST_STRING: &str = "kairos_string";
 pub const DST_LEGACY: &str = "kairos_legacy";
+pub const DST_NULL: &str = "kairos_null";
 
 /// Group types used by `Aggregator::can_aggregate`.
 pub const GROUP_NUMBER: &str = "number";
@@ -28,6 +29,9 @@ pub enum Value {
     Long(i64),
     Double(f64),
     Text(Arc<str>),
+    /// Gap marker emitted by the `gaps` aggregator (Java `NullDataPoint`);
+    /// renders as JSON `null` and is never stored.
+    Null,
     /// Plugin-defined type: raw stored bytes plus the datastore type that
     /// knows how to decode them.
     Custom {
@@ -42,6 +46,7 @@ impl Value {
             Value::Long(_) => DST_LONG,
             Value::Double(_) => DST_DOUBLE,
             Value::Text(_) => DST_STRING,
+            Value::Null => DST_NULL,
             Value::Custom { data_type, .. } => data_type,
         }
     }
@@ -50,6 +55,7 @@ impl Value {
         match self {
             Value::Long(_) | Value::Double(_) => GROUP_NUMBER,
             Value::Text(_) => GROUP_TEXT,
+            Value::Null => GROUP_NUMBER,
             Value::Custom { .. } => GROUP_TEXT,
         }
     }
@@ -80,6 +86,7 @@ impl Value {
                 out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
                 out.extend_from_slice(bytes);
             }
+            Value::Null => {}
             Value::Custom { bytes, .. } => out.extend_from_slice(bytes),
         }
     }
@@ -99,6 +106,7 @@ impl Value {
                     .expect("slice is 8 bytes");
                 Ok(Value::Double(f64::from_bits(u64::from_be_bytes(bytes))))
             }
+            DST_NULL => Ok(Value::Null),
             DST_STRING => {
                 let len_bytes: [u8; 2] = buf
                     .get(..2)

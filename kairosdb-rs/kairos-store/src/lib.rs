@@ -30,6 +30,23 @@ pub struct DatastoreQuery {
     pub end_time_ms: i64,
     pub tags: HashMap<String, Vec<String>>,
     pub limit: Option<usize>,
+    /// When true, `limit` keeps the most recent points instead of the
+    /// earliest. Returned points are always in ascending time order.
+    pub descending: bool,
+}
+
+/// Applies `limit` to an ascending series honoring the query order: keep the
+/// earliest N points ascending, or the latest N descending.
+pub(crate) fn apply_limit(points: &mut Vec<DataPoint>, query: &DatastoreQuery) {
+    if let Some(limit) = query.limit {
+        if query.descending {
+            if points.len() > limit {
+                points.drain(..points.len() - limit);
+            }
+        } else {
+            points.truncate(limit);
+        }
+    }
 }
 
 /// One stored series: a distinct tag set and its points in time order.

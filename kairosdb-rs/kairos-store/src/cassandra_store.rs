@@ -549,9 +549,7 @@ impl Datastore for CassandraDatastore {
         let mut results = Vec::new();
         for (tags, mut points) in by_tags {
             points.sort_by_key(|p| p.timestamp_ms);
-            if let Some(limit) = query.limit {
-                points.truncate(limit);
-            }
+            crate::apply_limit(&mut points, query);
             if !points.is_empty() {
                 results.push(SeriesData { tags, points });
             }

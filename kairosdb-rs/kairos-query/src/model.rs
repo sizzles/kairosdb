@@ -75,10 +75,19 @@ pub struct MetricQuery {
     #[serde(default)]
     pub tags: HashMap<String, OneOrMany>,
     pub limit: Option<usize>,
+    /// `asc` (default) or `desc`. Descending affects which points a `limit`
+    /// keeps (the most recent) and the response ordering.
+    pub order: Option<String>,
     #[serde(default)]
     pub aggregators: Vec<AggregatorSpec>,
     #[serde(default)]
     pub group_by: Vec<GroupBySpec>,
+}
+
+impl MetricQuery {
+    pub fn descending(&self) -> bool {
+        self.order.as_deref().is_some_and(|o| o.eq_ignore_ascii_case("desc"))
+    }
 }
 
 impl MetricQuery {
@@ -119,9 +128,24 @@ pub struct AggregatorSpec {
     pub divisor: Option<f64>,
     pub size: Option<i64>,
     pub unit: Option<TimeUnit>,
+    pub time_unit: Option<TimeUnit>,
     pub filter_op: Option<String>,
     pub threshold: Option<f64>,
     pub trim: Option<String>,
+    pub pad_value: Option<i64>,
+    pub thresholds: Option<Vec<ThresholdSpec>>,
+    /// `score`'s threshold order: `ascending` (default) or `descending`.
+    pub order: Option<String>,
+    /// `save_as` target metric and extra tags.
+    pub metric_name: Option<String>,
+    pub tags: Option<BTreeMap<String, String>>,
+    pub ttl: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ThresholdSpec {
+    pub value: f64,
+    pub boundary: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -282,8 +306,8 @@ impl PointGrouper {
 }
 
 /// Java `TimeGroupBy.convertGroupSizeToMillis`, fallthrough included: a year
-/// is 52 weeks.
-fn java_group_size_millis(value: i64, unit: TimeUnit) -> i64 {
+/// is 52 weeks. Also used by the `time_diff` aggregator's unit divisor.
+pub(crate) fn java_group_size_millis(value: i64, unit: TimeUnit) -> i64 {
     let mut ms = value;
     let factors: &[(TimeUnit, i64)] = &[
         (TimeUnit::Years, 52),
@@ -322,12 +346,14 @@ fn time_unit_name(unit: TimeUnit) -> &'static str {
 /// Executes a metric query over the series returned by the datastore:
 /// partition by tag group-by (or merge everything, the Java default), then by
 /// any point-level group-bys (time/value/bin), then run the aggregator chain
-/// anchored at the query start.
+/// anchored at the query start. Returns the result groups plus any series
+/// produced by `save_as` (the caller writes those back).
 pub fn execute(
     metric: &MetricQuery,
     series: Vec<SeriesInput>,
     query_start_ms: i64,
-) -> Result<Vec<GroupResult>> {
+    query_end_ms: i64,
+) -> Result<(Vec<GroupResult>, Vec<kairos_core::DataPointSet>)> {
     let group_tags: Vec<&String> = metric
         .group_by
         .iter()
@@ -350,6 +376,7 @@ pub fn execute(
     }
 
     let mut results = Vec::new();
+    let mut saved: Vec<kairos_core::DataPointSet> = Vec::new();
     for (key, members) in groups {
         let group: BTreeMap<String, String> = group_tags
             .iter()
@@ -383,9 +410,24 @@ pub fn execute(
         }
 
         for (ids, mut points) in partitions {
+            let ctx = crate::QueryContext {
+                start_ms: query_start_ms,
+                end_ms: query_end_ms,
+                source_metric: metric.name.clone(),
+                group_tags: group.clone(),
+                save_sink: std::sync::Mutex::new(Vec::new()),
+            };
             for spec in &metric.aggregators {
                 let aggregator = aggregators::build(spec)?;
-                points = aggregator.run(query_start_ms, points);
+                points = aggregator.run(&ctx, points);
+            }
+            saved.extend(ctx.save_sink.into_inner().expect("save sink poisoned"));
+
+            // Java sorts descending before aggregation; we aggregate
+            // ascending and reverse the output, which matches the response
+            // ordering for the practical cases (raw and most-recent-N).
+            if metric.descending() {
+                points.reverse();
             }
 
             let mut group_by_entries = Vec::new();
@@ -408,7 +450,7 @@ pub fn execute(
             });
         }
     }
-    Ok(results)
+    Ok((results, saved))
 }
 
 #[cfg(test)]
@@ -460,13 +502,14 @@ mod tests {
                 {"name": "sum", "sampling": {"value": 100, "unit": "milliseconds"},
                  "align_sampling": false}]}"#,
         );
-        let results = execute(
+        let (results, _) = execute(
             &metric,
             vec![
                 series(&[("host", "a")], &[(1, 1.0)]),
                 series(&[("host", "b")], &[(2, 2.0)]),
             ],
             0,
+            i64::MAX,
         )
         .unwrap();
         assert_eq!(results.len(), 1);
@@ -483,10 +526,11 @@ mod tests {
                  "range_size": {"value": 1, "unit": "days"}}]}"#,
         );
         const DAY: i64 = 86_400_000;
-        let results = execute(
+        let (results, _) = execute(
             &metric,
             vec![series(&[], &[(0, 1.0), (100, 2.0), (DAY + 5, 3.0)])],
             0,
+            i64::MAX,
         )
         .unwrap();
         assert_eq!(results.len(), 2);
@@ -501,10 +545,11 @@ mod tests {
         let metric = parse_metric(
             r#"{"name": "m", "group_by": [{"name": "value", "range_size": 10}]}"#,
         );
-        let results = execute(
+        let (results, _) = execute(
             &metric,
             vec![series(&[], &[(1, 3.0), (2, 25.0), (3, 7.0)])],
             0,
+            i64::MAX,
         )
         .unwrap();
         assert_eq!(results.len(), 2);
@@ -518,10 +563,11 @@ mod tests {
         let metric = parse_metric(
             r#"{"name": "m", "group_by": [{"name": "bin", "bins": [10, 20]}]}"#,
         );
-        let results = execute(
+        let (results, _) = execute(
             &metric,
             vec![series(&[], &[(1, 5.0), (2, 15.0), (3, 25.0)])],
             0,
+            i64::MAX,
         )
         .unwrap();
         assert_eq!(results.len(), 3);
@@ -535,7 +581,7 @@ mod tests {
     #[test]
     fn group_by_tag_splits_series() {
         let metric = parse_metric(r#"{"name": "m", "group_by": [{"name": "tag", "tags": ["host"]}]}"#);
-        let results = execute(
+        let (results, _) = execute(
             &metric,
             vec![
                 series(&[("host", "a")], &[(1, 1.0)]),
@@ -543,6 +589,7 @@ mod tests {
                 series(&[("host", "a"), ("dc", "lga")], &[(3, 3.0)]),
             ],
             0,
+            i64::MAX,
         )
         .unwrap();
         assert_eq!(results.len(), 2);

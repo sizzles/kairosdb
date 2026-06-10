@@ -49,9 +49,7 @@ impl Datastore for MemoryDatastore {
                 .range(query.start_time_ms..=query.end_time_ms)
                 .map(|(ts, value)| DataPoint::new(*ts, value.clone()))
                 .collect();
-            if let Some(limit) = query.limit {
-                series_points.truncate(limit);
-            }
+            crate::apply_limit(&mut series_points, query);
             if !series_points.is_empty() {
                 results.push(SeriesData {
                     tags: tags.clone(),
@@ -147,6 +145,7 @@ mod tests {
                 end_time_ms: 10_000,
                 tags: HashMap::new(),
                 limit: None,
+                descending: false,
             })
             .await
             .unwrap();
@@ -159,6 +158,7 @@ mod tests {
                 end_time_ms: 10_000,
                 tags: HashMap::from([("root".to_string(), vec!["CL".to_string()])]),
                 limit: None,
+                descending: false,
             })
             .await
             .unwrap();
