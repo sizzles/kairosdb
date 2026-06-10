@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+futures = "0.3.32"
 kairos-core = { path = "../kairos-core" }
 scylla = "1.6.0"
 thiserror = { workspace = true }

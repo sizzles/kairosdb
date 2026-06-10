@@ -22,8 +22,23 @@ pub struct QueryRequest {
 
 #[derive(Debug, Clone, Copy, Deserialize)]
 pub struct RelativeTime {
+    /// Java accepts both `"value": 1` and `"value": "1"`.
+    #[serde(deserialize_with = "lenient_i64")]
     pub value: i64,
     pub unit: TimeUnit,
+}
+
+fn lenient_i64<'de, D: serde::Deserializer<'de>>(de: D) -> std::result::Result<i64, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum NumOrStr {
+        Num(i64),
+        Str(String),
+    }
+    match NumOrStr::deserialize(de)? {
+        NumOrStr::Num(n) => Ok(n),
+        NumOrStr::Str(s) => s.parse().map_err(serde::de::Error::custom),
+    }
 }
 
 impl RelativeTime {
@@ -100,6 +115,13 @@ pub struct AggregatorSpec {
     pub align_start_time: Option<bool>,
     pub align_end_time: Option<bool>,
     pub factor: Option<f64>,
+    pub percentile: Option<f64>,
+    pub divisor: Option<f64>,
+    pub size: Option<i64>,
+    pub unit: Option<TimeUnit>,
+    pub filter_op: Option<String>,
+    pub threshold: Option<f64>,
+    pub trim: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -107,6 +129,11 @@ pub struct GroupBySpec {
     pub name: String,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// `time` group-by: `{"value": 1, "unit": "days"}`; `value` group-by: a
+    /// plain number.
+    pub range_size: Option<serde_json::Value>,
+    pub group_count: Option<i64>,
+    pub bins: Option<Vec<f64>>,
 }
 
 /// One stored series fed into query execution.
@@ -123,12 +150,179 @@ pub struct GroupResult {
     pub group: BTreeMap<String, String>,
     /// Union of tag values across the merged series, as in Java responses.
     pub tags: BTreeMap<String, Vec<String>>,
+    /// Response `group_by` entries (tag/time/value/bin), excluding the
+    /// always-present `type` entry.
+    pub group_by_entries: Vec<serde_json::Value>,
     pub points: Vec<DataPoint>,
 }
 
+/// Point-level grouper: assigns each point a group id, the analogue of
+/// `GroupBy.getGroupId`.
+enum PointGrouper {
+    /// `TimeGroupBy`: bucket index modulo `group_count`, anchored at the
+    /// query start. Months use calendar math; other units use Java's fixed
+    /// conversion (a "year" is 52 weeks).
+    Time {
+        range_value: i64,
+        range_unit: TimeUnit,
+        group_count: i64,
+        start_ms: i64,
+    },
+    /// `ValueGroupBy`: value truncated to an integer, divided by range size.
+    Value { range_size: i64 },
+    /// `BinGroupBy`: index of the half-open bin containing the value.
+    Bin { bins: Vec<f64> },
+}
+
+impl PointGrouper {
+    fn from_spec(spec: &GroupBySpec, query_start_ms: i64) -> Result<Option<PointGrouper>> {
+        match spec.name.as_str() {
+            "tag" => Ok(None), // handled at the series level
+            "time" => {
+                let range = spec.range_size.as_ref().ok_or_else(|| {
+                    Error::InvalidQuery("time group_by requires range_size".into())
+                })?;
+                let sampling: Sampling = serde_json::from_value(range.clone())
+                    .map_err(|e| Error::InvalidQuery(format!("invalid range_size: {e}")))?;
+                Ok(Some(PointGrouper::Time {
+                    range_value: sampling.value,
+                    range_unit: sampling.unit,
+                    group_count: spec.group_count.ok_or_else(|| {
+                        Error::InvalidQuery("time group_by requires group_count".into())
+                    })?,
+                    start_ms: query_start_ms,
+                }))
+            }
+            "value" => {
+                let range_size = spec
+                    .range_size
+                    .as_ref()
+                    .and_then(serde_json::Value::as_i64)
+                    .filter(|v| *v > 0)
+                    .ok_or_else(|| {
+                        Error::InvalidQuery("value group_by requires a numeric range_size".into())
+                    })?;
+                Ok(Some(PointGrouper::Value { range_size }))
+            }
+            "bin" => Ok(Some(PointGrouper::Bin {
+                bins: spec.bins.clone().filter(|b| !b.is_empty()).ok_or_else(|| {
+                    Error::InvalidQuery("bin group_by requires bins".into())
+                })?,
+            })),
+            other => Err(Error::InvalidQuery(format!("unknown group_by: {other}"))),
+        }
+    }
+
+    fn group_id(&self, point: &DataPoint) -> i32 {
+        match self {
+            PointGrouper::Time {
+                range_value,
+                range_unit,
+                group_count,
+                start_ms,
+            } => {
+                if *range_unit == TimeUnit::Months {
+                    let months = kairos_core::time::unit_difference(
+                        point.timestamp_ms,
+                        *start_ms,
+                        TimeUnit::Months,
+                    );
+                    (months % group_count) as i32
+                } else {
+                    let range_ms = java_group_size_millis(*range_value, *range_unit);
+                    (((point.timestamp_ms - start_ms) / range_ms) % group_count) as i32
+                }
+            }
+            PointGrouper::Value { range_size } => match &point.value {
+                kairos_core::Value::Long(v) => (v / range_size) as i32,
+                kairos_core::Value::Double(v) => (*v as i32) / *range_size as i32,
+                _ => -1,
+            },
+            PointGrouper::Bin { bins } => {
+                let Some(v) = point.value.as_f64() else { return -1 };
+                if v < bins[0] {
+                    return 0;
+                }
+                for i in 0..bins.len() - 1 {
+                    if v >= bins[i] && v < bins[i + 1] {
+                        return (i + 1) as i32;
+                    }
+                }
+                bins.len() as i32
+            }
+        }
+    }
+
+    /// Response entry for this grouper, matching `GroupByResult.toJson`.
+    fn result_entry(&self, id: i32) -> serde_json::Value {
+        match self {
+            PointGrouper::Time {
+                range_value,
+                range_unit,
+                group_count,
+                ..
+            } => serde_json::json!({
+                "name": "time",
+                "range_size": {"value": range_value, "unit": time_unit_name(*range_unit)},
+                "group_count": group_count,
+                "group": {"group_number": id},
+            }),
+            PointGrouper::Value { range_size } => serde_json::json!({
+                "name": "value",
+                "range_size": range_size,
+                "group": {"group_number": id},
+            }),
+            PointGrouper::Bin { bins } => serde_json::json!({
+                "name": "bin",
+                "bins": bins,
+                "group": {"bin_number": id},
+            }),
+        }
+    }
+}
+
+/// Java `TimeGroupBy.convertGroupSizeToMillis`, fallthrough included: a year
+/// is 52 weeks.
+fn java_group_size_millis(value: i64, unit: TimeUnit) -> i64 {
+    let mut ms = value;
+    let factors: &[(TimeUnit, i64)] = &[
+        (TimeUnit::Years, 52),
+        (TimeUnit::Weeks, 7),
+        (TimeUnit::Days, 24),
+        (TimeUnit::Hours, 60),
+        (TimeUnit::Minutes, 60),
+        (TimeUnit::Seconds, 1000),
+    ];
+    let mut multiplying = false;
+    for (u, factor) in factors {
+        if *u == unit {
+            multiplying = true;
+        }
+        if multiplying {
+            ms *= factor;
+        }
+    }
+    ms
+}
+
+/// Java `TimeUnit.toString()` for response JSON.
+fn time_unit_name(unit: TimeUnit) -> &'static str {
+    match unit {
+        TimeUnit::Milliseconds => "MILLISECONDS",
+        TimeUnit::Seconds => "SECONDS",
+        TimeUnit::Minutes => "MINUTES",
+        TimeUnit::Hours => "HOURS",
+        TimeUnit::Days => "DAYS",
+        TimeUnit::Weeks => "WEEKS",
+        TimeUnit::Months => "MONTHS",
+        TimeUnit::Years => "YEARS",
+    }
+}
+
 /// Executes a metric query over the series returned by the datastore:
-/// group by tags (or merge everything, the Java default), merge each group
-/// in time order, then run the aggregator chain anchored at the query start.
+/// partition by tag group-by (or merge everything, the Java default), then by
+/// any point-level group-bys (time/value/bin), then run the aggregator chain
+/// anchored at the query start.
 pub fn execute(
     metric: &MetricQuery,
     series: Vec<SeriesInput>,
@@ -140,6 +334,11 @@ pub fn execute(
         .filter(|g| g.name == "tag")
         .flat_map(|g| g.tags.iter())
         .collect();
+    let groupers: Vec<PointGrouper> = metric
+        .group_by
+        .iter()
+        .filter_map(|g| PointGrouper::from_spec(g, query_start_ms).transpose())
+        .collect::<Result<_>>()?;
 
     let mut groups: BTreeMap<Vec<String>, Vec<SeriesInput>> = BTreeMap::new();
     for s in series {
@@ -171,12 +370,43 @@ pub fn execute(
         }
         points.sort_by_key(|p| p.timestamp_ms);
 
-        for spec in &metric.aggregators {
-            let aggregator = aggregators::build(spec)?;
-            points = aggregator.run(query_start_ms, points);
+        // Partition the merged points by the point-level group ids, then
+        // aggregate each partition independently.
+        let mut partitions: BTreeMap<Vec<i32>, Vec<DataPoint>> = BTreeMap::new();
+        if groupers.is_empty() {
+            partitions.insert(Vec::new(), points);
+        } else {
+            for point in points {
+                let ids: Vec<i32> = groupers.iter().map(|g| g.group_id(&point)).collect();
+                partitions.entry(ids).or_default().push(point);
+            }
         }
 
-        results.push(GroupResult { group, tags, points });
+        for (ids, mut points) in partitions {
+            for spec in &metric.aggregators {
+                let aggregator = aggregators::build(spec)?;
+                points = aggregator.run(query_start_ms, points);
+            }
+
+            let mut group_by_entries = Vec::new();
+            if !group_tags.is_empty() {
+                group_by_entries.push(serde_json::json!({
+                    "name": "tag",
+                    "tags": group_tags,
+                    "group": group,
+                }));
+            }
+            for (grouper, id) in groupers.iter().zip(&ids) {
+                group_by_entries.push(grouper.result_entry(*id));
+            }
+
+            results.push(GroupResult {
+                group: group.clone(),
+                tags: tags.clone(),
+                group_by_entries,
+                points,
+            });
+        }
     }
     Ok(results)
 }
@@ -242,6 +472,64 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].points, vec![DataPoint::new(1, Value::Double(3.0))]);
         assert_eq!(results[0].tags["host"], vec!["a", "b"]);
+    }
+
+    #[test]
+    fn group_by_time_buckets_by_day_of_week() {
+        // Two-group day-of-week style grouping: 1-day ranges, 2 groups.
+        let metric = parse_metric(
+            r#"{"name": "m", "group_by": [
+                {"name": "time", "group_count": 2,
+                 "range_size": {"value": 1, "unit": "days"}}]}"#,
+        );
+        const DAY: i64 = 86_400_000;
+        let results = execute(
+            &metric,
+            vec![series(&[], &[(0, 1.0), (100, 2.0), (DAY + 5, 3.0)])],
+            0,
+        )
+        .unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].group_by_entries[0]["group"]["group_number"], 0);
+        assert_eq!(results[0].points.len(), 2);
+        assert_eq!(results[1].group_by_entries[0]["group"]["group_number"], 1);
+        assert_eq!(results[1].points.len(), 1);
+    }
+
+    #[test]
+    fn group_by_value_buckets_by_magnitude() {
+        let metric = parse_metric(
+            r#"{"name": "m", "group_by": [{"name": "value", "range_size": 10}]}"#,
+        );
+        let results = execute(
+            &metric,
+            vec![series(&[], &[(1, 3.0), (2, 25.0), (3, 7.0)])],
+            0,
+        )
+        .unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].group_by_entries[0]["group"]["group_number"], 0);
+        assert_eq!(results[0].points.len(), 2);
+        assert_eq!(results[1].group_by_entries[0]["group"]["group_number"], 2);
+    }
+
+    #[test]
+    fn group_by_bin_uses_half_open_bins() {
+        let metric = parse_metric(
+            r#"{"name": "m", "group_by": [{"name": "bin", "bins": [10, 20]}]}"#,
+        );
+        let results = execute(
+            &metric,
+            vec![series(&[], &[(1, 5.0), (2, 15.0), (3, 25.0)])],
+            0,
+        )
+        .unwrap();
+        assert_eq!(results.len(), 3);
+        let ids: Vec<_> = results
+            .iter()
+            .map(|r| r.group_by_entries[0]["group"]["bin_number"].as_i64().unwrap())
+            .collect();
+        assert_eq!(ids, vec![0, 1, 2]);
     }
 
     #[test]

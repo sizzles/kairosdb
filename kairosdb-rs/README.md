@@ -10,9 +10,9 @@ with commodity-market-data extensions to follow.
 | Crate | Contents |
 |---|---|
 | `kairos-core` | Data model (`Value`, `DataPoint`, `DataPointSet`), the zig-zag varint value codec (byte-compatible with `org.kairosdb.util.Util`), time units and the `RangeAggregator` bucketing math |
-| `kairos-store` | `Datastore` trait, in-memory backend, and the **Cassandra backend** (`scylla` driver) using the Java schema: `data_points`, `row_keys`, `row_key_time_index`, `string_index`, `spec` |
-| `kairos-query` | Range-aggregation engine, built-in aggregators (`sum`, `avg`, `min`, `max`, `count`, `first`, `last`, `scale`, `diff`), tag group-by, and the wire-compatible query JSON model |
-| `kairosd` | Server binary: `/api/v1` REST endpoints (`datapoints`, `datapoints/query`, `metricnames`, `version`) on axum, backed by memory or Cassandra |
+| `kairos-store` | `Datastore` trait, in-memory backend, the **WAL** (segmented, CRC-checked, checkpointed), and the **Cassandra backend** (`scylla` driver, concurrent reads, batched writes) using the Java schema: `data_points`, `row_keys`, `row_key_time_index`, `string_index`, `spec` |
+| `kairos-query` | Range-aggregation engine; aggregators `sum`, `avg`, `min`, `max`, `count`, `dev`, `percentile`, `first`, `last`, `scale`, `div`, `diff`, `rate`, `sma`, `filter`, `trim`; group-bys `tag`, `time`, `value`, `bin`; wire-compatible query JSON model |
+| `kairosd` | Server binary: `/api/v1` REST endpoints (`datapoints`, `datapoints/query`, `metricnames`, `rollups`, `version`) on axum; durable ingest pipeline (WAL → queue → batched writes, replay on restart); rollup scheduler |
 
 ## Verified storage-level interop with Java KairosDB
 
@@ -26,7 +26,20 @@ implementation (1.4.0-SNAPSHOT) running on the same Cassandra 4.1 keyspace:
 
 Row-key blobs, column-time encoding (legacy and modern), value encodings, and
 the `spec`-table row-format negotiation all match `ClusterConnection` /
-`CQLBatch` semantics.
+`CQLBatch` semantics. Aggregator results (`percentile`, `dev`, `sma`, `rate`,
+`max`, …) and `time` group-by output were verified bit-identical between the
+two servers on shared data.
+
+## Performance (same box, same single-node Cassandra 4.1, 100k points)
+
+| | Java 1.4.0-SNAPSHOT | kairosd (release) |
+|---|---|---|
+| Ingest ack rate | ~80k pts/s | ~510k pts/s (WAL-durable) |
+| Ingest → queryable | ~40–50k pts/s | ~75–90k pts/s |
+| Query 100k points (avg to 1h buckets) | ~105–115 ms | ~80–95 ms |
+
+Rough single-run numbers from this repo's dev container, not a tuned
+benchmark; the end-to-end drain is bottlenecked by the shared Cassandra node.
 
 ## Running
 
@@ -69,7 +82,8 @@ curl -X POST localhost:8080/api/v1/datapoints/query -d '{
 
 ## Not here yet (see the proposal)
 
-Telnet ingest, WAL-backed ingest queue, rollups, remaining
-aggregators/group-bys, legacy (pre-1.1) value decoding, batched Cassandra
-writes, and the `kairos-commodity` crate (reference data, OHLCV values,
-curve queries, continuous contracts).
+Telnet ingest, the remaining niche aggregators (`least_squares`, `sampler`,
+`save_as`, `gaps`, `limit`), per-query time zones (calendar math is
+UTC-only), distributed rollup assignment (rollups are single-node), legacy
+(pre-1.1) value decoding, and the `kairos-commodity` crate (reference data,
+OHLCV values, curve queries, continuous contracts).

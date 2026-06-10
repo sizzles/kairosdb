@@ -4,6 +4,7 @@
 pub mod cassandra;
 pub mod cassandra_store;
 pub mod memory;
+pub mod wal;
 
 use std::collections::HashMap;
 

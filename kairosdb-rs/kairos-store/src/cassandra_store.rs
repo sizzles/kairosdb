@@ -10,10 +10,12 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use futures::stream::{self, StreamExt, TryStreamExt};
 use kairos_core::value::DST_LEGACY;
 use kairos_core::{DataPoint, DataPointSet, Tags, Value};
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
+use scylla::statement::batch::{Batch, BatchType};
 use scylla::statement::prepared::PreparedStatement;
 use scylla::value::CqlTimestamp;
 
@@ -292,7 +294,9 @@ impl CassandraDatastore {
     }
 
     /// Row keys matching the query, via `row_key_time_index` then `row_keys`,
-    /// filtered by data type and tags like `CQLFilteredRowKeyIterator`.
+    /// filtered by data type and tags like `CQLFilteredRowKeyIterator`. The
+    /// per-window `row_keys` lookups run concurrently, as the Java driver's
+    /// async futures do.
     async fn matching_row_keys(&self, query: &DatastoreQuery) -> Result<Vec<DataPointsRowKey>> {
         let start_row_time = self.spec.calculate_row_time(query.start_time_ms);
         let times = self
@@ -311,42 +315,49 @@ impl CassandraDatastore {
             .into_rows_result()
             .map_err(|e| store_err("row_key_time_index rows", e))?;
 
-        let mut row_keys = Vec::new();
+        let mut row_times = Vec::new();
         for time_row in times
             .rows::<(CqlTimestamp,)>()
             .map_err(|e| store_err("row_key_time_index decode", e))?
         {
-            let row_time = time_row
-                .map_err(|e| store_err("row_key_time_index row", e))?
-                .0;
-            let keys = self
-                .session
-                .execute_unpaged(
-                    &self.ps_row_key_query,
-                    (query.metric.as_str(), DATA_POINTS_TABLE, row_time),
-                )
-                .await
-                .map_err(|e| store_err("row_keys query", e))?
-                .into_rows_result()
-                .map_err(|e| store_err("row_keys rows", e))?;
-            for key_row in keys
-                .rows::<(CqlTimestamp, String, HashMap<String, String>)>()
-                .map_err(|e| store_err("row_keys decode", e))?
-            {
-                let (row_time, data_type, tags) =
-                    key_row.map_err(|e| store_err("row_keys row", e))?;
-                let tags: Tags = tags.into_iter().collect();
-                if tags_match(&tags, &query.tags) {
-                    row_keys.push(DataPointsRowKey {
-                        metric_name: query.metric.clone(),
-                        row_time_ms: row_time.0,
-                        data_type,
-                        tags,
-                    });
-                }
-            }
+            row_times.push(time_row.map_err(|e| store_err("row_key_time_index row", e))?.0);
         }
-        Ok(row_keys)
+
+        let key_batches: Vec<Vec<DataPointsRowKey>> =
+            stream::iter(row_times.into_iter().map(|row_time| async move {
+                let keys = self
+                    .session
+                    .execute_unpaged(
+                        &self.ps_row_key_query,
+                        (query.metric.as_str(), DATA_POINTS_TABLE, row_time),
+                    )
+                    .await
+                    .map_err(|e| store_err("row_keys query", e))?
+                    .into_rows_result()
+                    .map_err(|e| store_err("row_keys rows", e))?;
+                let mut row_keys = Vec::new();
+                for key_row in keys
+                    .rows::<(CqlTimestamp, String, HashMap<String, String>)>()
+                    .map_err(|e| store_err("row_keys decode", e))?
+                {
+                    let (row_time, data_type, tags) =
+                        key_row.map_err(|e| store_err("row_keys row", e))?;
+                    let tags: Tags = tags.into_iter().collect();
+                    if tags_match(&tags, &query.tags) {
+                        row_keys.push(DataPointsRowKey {
+                            metric_name: query.metric.clone(),
+                            row_time_ms: row_time.0,
+                            data_type,
+                            tags,
+                        });
+                    }
+                }
+                Ok::<_, Error>(row_keys)
+            }))
+            .buffer_unordered(READ_CONCURRENCY)
+            .try_collect()
+            .await?;
+        Ok(key_batches.into_iter().flatten().collect())
     }
 
     /// Column-name bounds for one row, matching `CassandraDatastore`: clamp
@@ -409,6 +420,13 @@ impl CassandraDatastore {
     }
 }
 
+/// Cassandra rejects oversized batches; chunk like the Java `CQLBatch`
+/// host-partitioned batching does.
+const WRITE_BATCH_SIZE: usize = 64;
+
+/// In-flight read fan-out, the analogue of the Java query semaphore.
+const READ_CONCURRENCY: usize = 16;
+
 impl Datastore for CassandraDatastore {
     async fn write(&self, set: DataPointSet) -> Result<()> {
         let now_ms = std::time::SystemTime::now()
@@ -419,6 +437,10 @@ impl Datastore for CassandraDatastore {
         let row_key_ttl = self.row_key_ttl(set.ttl);
         let cql_tags: HashMap<String, String> = set.tags.clone().into_iter().collect();
 
+        // Data point inserts go out in unlogged batches; the row-key index
+        // writes below are amortized to one per (row window, data type).
+        let mut point_rows: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, i32, i64)> =
+            Vec::with_capacity(set.points.len());
         let mut indexed_rows: BTreeMap<i64, Vec<String>> = BTreeMap::new();
         for point in &set.points {
             let row_time = self.spec.calculate_row_time(point.timestamp_ms);
@@ -432,19 +454,13 @@ impl Datastore for CassandraDatastore {
             let column = self.spec.column_name(row_time, point.timestamp_ms);
             let mut value_bytes = Vec::new();
             point.value.write_to(&mut value_bytes);
-            self.session
-                .execute_unpaged(
-                    &self.ps_data_point_insert,
-                    (
-                        row_key.to_bytes(),
-                        column.to_be_bytes().to_vec(),
-                        value_bytes,
-                        point_ttl,
-                        now_ms,
-                    ),
-                )
-                .await
-                .map_err(|e| store_err("data_points insert", e))?;
+            point_rows.push((
+                row_key.to_bytes(),
+                column.to_be_bytes().to_vec(),
+                value_bytes,
+                point_ttl,
+                now_ms,
+            ));
 
             // Index each (row_time, data_type) once per write call.
             let types = indexed_rows.entry(row_time).or_default();
@@ -479,6 +495,24 @@ impl Datastore for CassandraDatastore {
             }
         }
 
+        for chunk in point_rows.chunks(WRITE_BATCH_SIZE) {
+            if let [single] = chunk {
+                self.session
+                    .execute_unpaged(&self.ps_data_point_insert, single)
+                    .await
+                    .map_err(|e| store_err("data_points insert", e))?;
+                continue;
+            }
+            let mut batch = Batch::new(BatchType::Unlogged);
+            for _ in chunk {
+                batch.append_statement(self.ps_data_point_insert.clone());
+            }
+            self.session
+                .batch(&batch, chunk.to_vec())
+                .await
+                .map_err(|e| store_err("data_points batch insert", e))?;
+        }
+
         self.index_string(ROW_KEY_METRIC_NAMES, &set.name).await?;
         for (tag_name, tag_value) in &set.tags {
             self.index_string(ROW_KEY_TAG_NAMES, tag_name).await?;
@@ -488,14 +522,28 @@ impl Datastore for CassandraDatastore {
     }
 
     async fn query(&self, query: &DatastoreQuery) -> Result<Vec<SeriesData>> {
+        // Legacy (pre-1.1) value encoding is not supported yet.
+        let row_keys: Vec<DataPointsRowKey> = self
+            .matching_row_keys(query)
+            .await?
+            .into_iter()
+            .filter(|rk| rk.data_type != DST_LEGACY)
+            .collect();
+
+        // Fan the per-row reads out concurrently, like the Java
+        // semaphore-bounded async query path.
+        let rows: Vec<(Tags, Vec<DataPoint>)> =
+            stream::iter(row_keys.into_iter().map(|row_key| async move {
+                let points = self.read_row(&row_key, query).await?;
+                Ok::<_, Error>((row_key.tags, points))
+            }))
+            .buffer_unordered(READ_CONCURRENCY)
+            .try_collect()
+            .await?;
+
         let mut by_tags: BTreeMap<Tags, Vec<DataPoint>> = BTreeMap::new();
-        for row_key in self.matching_row_keys(query).await? {
-            if row_key.data_type == DST_LEGACY {
-                // Legacy (pre-1.1) value encoding is not supported yet.
-                continue;
-            }
-            let points = self.read_row(&row_key, query).await?;
-            by_tags.entry(row_key.tags).or_default().extend(points);
+        for (tags, points) in rows {
+            by_tags.entry(tags).or_default().extend(points);
         }
 
         let mut results = Vec::new();

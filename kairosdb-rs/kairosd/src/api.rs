@@ -2,27 +2,39 @@
 
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use kairos_core::{DataPoint, DataPointSet, Value};
-use kairos_query::model::{QueryRequest, SeriesInput};
+use kairos_query::model::{GroupResult, MetricQuery, QueryRequest, SeriesInput};
 use kairos_store::{Datastore, DatastoreQuery};
 use serde_json::{json, Value as JsonValue};
 
+use crate::ingest::Ingest;
+use crate::rollup::{RollupError, RollupManager};
 use crate::store::AnyDatastore;
 
-type Store = Arc<AnyDatastore>;
+#[derive(Clone)]
+pub struct AppState {
+    pub store: Arc<AnyDatastore>,
+    pub ingest: Ingest,
+    pub rollups: Arc<RollupManager>,
+}
 
-pub fn router(store: Store) -> Router {
+pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/v1/version", get(version))
         .route("/api/v1/metricnames", get(metric_names))
         .route("/api/v1/datapoints", post(add_datapoints))
         .route("/api/v1/datapoints/query", post(query_datapoints))
-        .with_state(store)
+        .route("/api/v1/rollups", post(create_rollup).get(list_rollups))
+        .route(
+            "/api/v1/rollups/{id}",
+            delete(delete_rollup).get(get_rollup),
+        )
+        .with_state(state)
 }
 
 /// Errors are returned as `{"errors": [...]}` with a 400, like the Java
@@ -43,8 +55,9 @@ async fn version() -> Json<JsonValue> {
     Json(json!({ "version": concat!("KairosDB-rs ", env!("CARGO_PKG_VERSION")) }))
 }
 
-async fn metric_names(State(store): State<Store>) -> Result<Json<JsonValue>, ApiError> {
-    let names = store
+async fn metric_names(State(state): State<AppState>) -> Result<Json<JsonValue>, ApiError> {
+    let names = state
+        .store
         .metric_names(None)
         .await
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -53,9 +66,10 @@ async fn metric_names(State(store): State<Store>) -> Result<Json<JsonValue>, Api
 
 /// Ingest format: an array of metric objects (a single object is also
 /// accepted), each carrying `tags` plus either `datapoints: [[ts, value]]`
-/// or a single `timestamp`/`value` pair.
+/// or a single `timestamp`/`value` pair. Sets are acknowledged once durable
+/// in the WAL and queued, not once stored.
 async fn add_datapoints(
-    State(store): State<Store>,
+    State(state): State<AppState>,
     Json(body): Json<JsonValue>,
 ) -> Result<StatusCode, ApiError> {
     let metrics: Vec<&JsonValue> = match &body {
@@ -66,8 +80,9 @@ async fn add_datapoints(
 
     for metric in metrics {
         let set = parse_metric(metric)?;
-        store
-            .write(set)
+        state
+            .ingest
+            .submit(set)
             .await
             .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     }
@@ -142,8 +157,38 @@ fn parse_value(value: &JsonValue) -> Result<Value, ApiError> {
     }
 }
 
+/// Datastore fetch + group/aggregate pipeline for one metric query; shared
+/// between the query endpoint and the rollup executor.
+pub(crate) async fn run_metric_query(
+    store: &AnyDatastore,
+    metric: &MetricQuery,
+    start_ms: i64,
+    end_ms: i64,
+) -> Result<(usize, Vec<GroupResult>), String> {
+    let series = store
+        .query(&DatastoreQuery {
+            metric: metric.name.clone(),
+            start_time_ms: start_ms,
+            end_time_ms: end_ms,
+            tags: metric.tag_filter(),
+            limit: metric.limit,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let sample_size: usize = series.iter().map(|s| s.points.len()).sum();
+    let inputs: Vec<SeriesInput> = series
+        .into_iter()
+        .map(|s| SeriesInput { tags: s.tags, points: s.points })
+        .collect();
+
+    let groups =
+        kairos_query::model::execute(metric, inputs, start_ms).map_err(|e| e.to_string())?;
+    Ok((sample_size, groups))
+}
+
 async fn query_datapoints(
-    State(store): State<Store>,
+    State(state): State<AppState>,
     Json(request): Json<QueryRequest>,
 ) -> Result<Json<JsonValue>, ApiError> {
     let now_ms = chrono::Utc::now().timestamp_millis();
@@ -153,39 +198,15 @@ async fn query_datapoints(
 
     let mut queries = Vec::new();
     for metric in &request.metrics {
-        let series = store
-            .query(&DatastoreQuery {
-                metric: metric.name.clone(),
-                start_time_ms: start_ms,
-                end_time_ms: end_ms,
-                tags: metric.tag_filter(),
-                limit: metric.limit,
-            })
+        let (sample_size, groups) = run_metric_query(&state.store, metric, start_ms, end_ms)
             .await
-            .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            .map_err(bad_request)?;
 
-        let sample_size: usize = series.iter().map(|s| s.points.len()).sum();
-        let inputs: Vec<SeriesInput> = series
-            .into_iter()
-            .map(|s| SeriesInput { tags: s.tags, points: s.points })
-            .collect();
-
-        let groups = kairos_query::model::execute(metric, inputs, start_ms)
-            .map_err(|e| bad_request(e.to_string()))?;
-
-        let grouped_by_tag = metric.group_by.iter().any(|g| g.name == "tag");
         let results: Vec<JsonValue> = groups
             .into_iter()
             .map(|g| {
                 let mut group_by = vec![json!({"name": "type", "type": "number"})];
-                if grouped_by_tag {
-                    let tag_names: Vec<&String> = g.group.keys().collect();
-                    group_by.push(json!({
-                        "name": "tag",
-                        "tags": tag_names,
-                        "group": g.group,
-                    }));
-                }
+                group_by.extend(g.group_by_entries.iter().cloned());
                 json!({
                     "name": metric.name,
                     "group_by": group_by,
@@ -199,6 +220,54 @@ async fn query_datapoints(
     }
 
     Ok(Json(json!({ "queries": queries })))
+}
+
+impl From<RollupError> for ApiError {
+    fn from(e: RollupError) -> Self {
+        match e {
+            RollupError::NotFound(_) => ApiError(StatusCode::NOT_FOUND, e.to_string()),
+            RollupError::Invalid(_) => bad_request(e.to_string()),
+            RollupError::Persist(_) => ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        }
+    }
+}
+
+/// Response shape matches the Java `RollUpResource`: the task id plus a
+/// resource link.
+async fn create_rollup(
+    State(state): State<AppState>,
+    Json(task): Json<JsonValue>,
+) -> Result<Json<JsonValue>, ApiError> {
+    let stored = state.rollups.create(task)?;
+    let id = stored["id"].as_str().unwrap_or_default();
+    Ok(Json(json!({
+        "id": id,
+        "name": stored["name"],
+        "attributes": {"url": format!("/api/v1/rollups/{id}")},
+    })))
+}
+
+async fn list_rollups(State(state): State<AppState>) -> Json<JsonValue> {
+    Json(JsonValue::Array(state.rollups.list()))
+}
+
+async fn get_rollup(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<JsonValue>, ApiError> {
+    state
+        .rollups
+        .get(&id)
+        .map(Json)
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("rollup task not found: {id}")))
+}
+
+async fn delete_rollup(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    state.rollups.delete(&id)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 fn value_pair(point: &DataPoint) -> JsonValue {
@@ -220,8 +289,16 @@ mod tests {
     use kairos_store::memory::MemoryDatastore;
     use tower::ServiceExt;
 
-    fn memory_router() -> Router {
-        router(Arc::new(AnyDatastore::Memory(MemoryDatastore::new())))
+    async fn memory_router() -> Router {
+        let store = Arc::new(AnyDatastore::Memory(MemoryDatastore::new()));
+        let ingest = Ingest::start(None, store.clone()).await.unwrap();
+        let rollups = RollupManager::start(store.clone(), ingest.clone(), None);
+        router(AppState { store, ingest, rollups })
+    }
+
+    /// Ingest is asynchronous; tests must let the consumer drain.
+    async fn settle() {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
 
     async fn send(app: &Router, method: &str, uri: &str, body: JsonValue) -> (StatusCode, JsonValue) {
@@ -249,7 +326,7 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_and_query_roundtrip() {
-        let app = memory_router();
+        let app = memory_router().await;
 
         let (status, _) = send(
             &app,
@@ -263,6 +340,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
+        settle().await;
 
         let (status, body) = send(
             &app,
@@ -296,7 +374,7 @@ mod tests {
 
     #[tokio::test]
     async fn group_by_tag_returns_separate_results() {
-        let app = memory_router();
+        let app = memory_router().await;
         send(
             &app,
             "POST",
@@ -307,6 +385,7 @@ mod tests {
             ]),
         )
         .await;
+        settle().await;
 
         let (_, body) = send(
             &app,
@@ -325,8 +404,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rollup_executes_and_writes_save_as_metric() {
+        let app = memory_router().await;
+        send(
+            &app,
+            "POST",
+            "/api/v1/datapoints",
+            json!([{"name": "roll.src", "tags": {"host": "a"},
+                    "datapoints": [[1, 10.0], [2, 20.0]]}]),
+        )
+        .await;
+        settle().await;
+
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/api/v1/rollups",
+            json!({
+                "name": "TestRollup",
+                "execution_interval": {"value": 1, "unit": "seconds"},
+                "rollups": [{
+                    "save_as": "roll.dst",
+                    "query": {
+                        "start_absolute": 0,
+                        "metrics": [{
+                            "name": "roll.src",
+                            "aggregators": [{
+                                "name": "sum",
+                                "sampling": {"value": 1, "unit": "hours"},
+                                "align_sampling": false
+                            }]
+                        }]
+                    }
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let id = body["id"].as_str().unwrap().to_string();
+
+        // The scheduler skips the immediate tick, so the first execution
+        // lands after ~1s; allow a couple of cycles plus ingest settling.
+        tokio::time::sleep(std::time::Duration::from_millis(2600)).await;
+
+        let (_, body) = send(
+            &app,
+            "POST",
+            "/api/v1/datapoints/query",
+            json!({"start_absolute": 0, "metrics": [{"name": "roll.dst"}]}),
+        )
+        .await;
+        let values = body["queries"][0]["results"][0]["values"]
+            .as_array()
+            .expect("rolled-up values");
+        assert_eq!(values[0][1], 30.0);
+        // The source tag carried over to the rolled-up series.
+        assert_eq!(body["queries"][0]["results"][0]["tags"]["host"][0], "a");
+
+        // Delete stops the task and 404s afterwards.
+        let (status, _) = send(&app, "DELETE", &format!("/api/v1/rollups/{id}"), json!({})).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _) = send(&app, "GET", &format!("/api/v1/rollups/{id}"), json!({})).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn rejects_empty_metric_name() {
-        let app = memory_router();
+        let app = memory_router().await;
         let (status, body) = send(
             &app,
             "POST",
