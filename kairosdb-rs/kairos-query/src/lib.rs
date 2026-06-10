@@ -67,6 +67,13 @@ pub trait RangeSubAggregator: Send + Sync {
     fn wants_columnar(&self) -> bool {
         false
     }
+
+    /// Whether this kernel produces results from the f64 value column
+    /// identical to its row form (no value-type preservation, no text).
+    /// Gates the zero-materialization Parquet scan path.
+    fn columnar_safe(&self) -> bool {
+        false
+    }
 }
 
 /// Transforms a whole series — the analogue of non-range aggregators such as
@@ -90,6 +97,57 @@ pub enum Aggregator {
 }
 
 impl Aggregator {
+    /// True when this stage can consume a (timestamps, values) column pair
+    /// directly via [`Aggregator::run_columns`].
+    pub fn columnar_capable(&self) -> bool {
+        match self {
+            Aggregator::Range { exhaustive, sub, .. } => !exhaustive && sub.columnar_safe(),
+            Aggregator::Series(_) => false,
+        }
+    }
+
+    /// Runs a columnar-capable Range stage directly over column slices:
+    /// bucket boundaries scan the contiguous timestamp array and kernels
+    /// consume value slices — no per-point materialization.
+    pub fn run_columns(&self, ctx: &QueryContext, ts: &[i64], vals: &[f64]) -> Vec<DataPoint> {
+        let Aggregator::Range {
+            sampling,
+            align_sampling,
+            align_start_time,
+            align_end_time,
+            sub,
+            ..
+        } = self
+        else {
+            unreachable!("run_columns requires columnar_capable()");
+        };
+        let anchor = if *align_sampling {
+            align_range_boundary_tz(ctx.start_ms, sampling.unit, ctx.tz)
+        } else {
+            ctx.start_ms
+        };
+        let calc = RangeCalc::new_tz(anchor, *sampling, ctx.tz);
+        let mut out = Vec::new();
+        let mut start = 0;
+        while start < ts.len() {
+            let end_range = calc.end_range(ts[start]);
+            let mut end = start + 1;
+            while end < ts.len() && ts[end] < end_range {
+                end += 1;
+            }
+            let return_time = if *align_start_time {
+                calc.start_range(ts[start])
+            } else if *align_end_time {
+                calc.end_range(ts[start])
+            } else {
+                ts[start]
+            };
+            out.extend(sub.aggregate_columnar(return_time, &vals[start..end], &[]));
+            start = end;
+        }
+        out
+    }
+
     /// Runs this aggregator over a sorted series. `ctx.start_ms` anchors the
     /// range grid, exactly as `RangeAggregator.setStartTime` does.
     pub fn run(&self, ctx: &QueryContext, points: Vec<DataPoint>) -> Vec<DataPoint> {

@@ -61,6 +61,17 @@ impl Datastore for AnyDatastore {
         }
     }
 
+    async fn query_columns(
+        &self,
+        query: &DatastoreQuery,
+    ) -> Result<Option<Vec<kairos_core::ColumnSeries>>> {
+        match self {
+            AnyDatastore::TieredMemory(s) => s.query_columns(query).await,
+            AnyDatastore::TieredCassandra(s) => s.query_columns(query).await,
+            _ => Ok(None),
+        }
+    }
+
     async fn metric_names(&self, prefix: Option<&str>) -> Result<Vec<String>> {
         match self {
             AnyDatastore::Memory(s) => s.metric_names(prefix).await,

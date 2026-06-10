@@ -38,6 +38,7 @@ impl Ingest {
             let records = wal.replay()?;
             if !records.is_empty() {
                 tracing::info!("replaying {} datapoint sets from wal", records.len());
+                crate::metrics::add(&crate::metrics::WAL_REPLAYED_SETS, records.len() as u64);
                 let mut last = None;
                 for (pos, set) in records {
                     store.write(set).await?;

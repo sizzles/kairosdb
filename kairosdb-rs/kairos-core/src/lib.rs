@@ -11,7 +11,7 @@ pub mod time;
 pub mod value;
 pub mod varint;
 
-pub use datapoint::{DataPoint, DataPointSet, Tags};
+pub use datapoint::{ColumnSeries, DataPoint, DataPointSet, Tags};
 pub use time::{Sampling, TimeUnit};
 pub use value::Value;
 

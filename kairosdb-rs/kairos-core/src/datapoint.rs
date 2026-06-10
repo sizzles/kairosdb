@@ -24,6 +24,27 @@ impl DataPoint {
     }
 }
 
+/// One series in columnar form: parallel timestamp/value arrays, sorted by
+/// timestamp. The shape Parquet scans produce and the vector kernels
+/// consume; numeric-only (longs are widened to f64, as aggregators do).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColumnSeries {
+    pub tags: Tags,
+    pub timestamps: Vec<i64>,
+    pub values: Vec<f64>,
+}
+
+impl ColumnSeries {
+    /// Materializes row form (values become doubles).
+    pub fn to_points(&self) -> Vec<DataPoint> {
+        self.timestamps
+            .iter()
+            .zip(&self.values)
+            .map(|(ts, v)| DataPoint::new(*ts, *v))
+            .collect()
+    }
+}
+
 /// A named series of points sharing one tag set — the unit of ingestion.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DataPointSet {

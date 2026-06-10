@@ -174,6 +174,123 @@ pub struct GroupBySpec {
     pub bins: Option<Vec<f64>>,
 }
 
+/// Columnar query execution: consumes Parquet-scan output without
+/// materializing rows. Falls back to the row path when the query needs it
+/// (point-level group-bys, a chain that is not columnar-capable end to
+/// first-Range-stage, or no aggregators at all).
+pub fn execute_columnar(
+    metric: &MetricQuery,
+    series: Vec<kairos_core::ColumnSeries>,
+    query_start_ms: i64,
+    query_end_ms: i64,
+    tz: chrono_tz::Tz,
+    fast: bool,
+) -> Result<(Vec<GroupResult>, Vec<kairos_core::DataPointSet>)> {
+    let has_point_groupers = metric
+        .group_by
+        .iter()
+        .any(|g| matches!(g.name.as_str(), "time" | "value" | "bin"));
+    let first_capable = match metric.aggregators.first() {
+        Some(spec) => aggregators::build(spec, fast)?.columnar_capable(),
+        None => false,
+    };
+    if has_point_groupers || !first_capable {
+        // Materialize once and use the row pipeline.
+        let rows = series
+            .into_iter()
+            .map(|c| SeriesInput { tags: c.tags.clone(), points: c.to_points() })
+            .collect();
+        return execute(metric, rows, query_start_ms, query_end_ms, tz, fast);
+    }
+
+    let group_tags: Vec<&String> = metric
+        .group_by
+        .iter()
+        .filter(|g| g.name == "tag")
+        .flat_map(|g| g.tags.iter())
+        .collect();
+
+    let mut groups: BTreeMap<Vec<String>, Vec<kairos_core::ColumnSeries>> = BTreeMap::new();
+    for s in series {
+        let key: Vec<String> = group_tags
+            .iter()
+            .map(|t| s.tags.get(*t).cloned().unwrap_or_default())
+            .collect();
+        groups.entry(key).or_default().push(s);
+    }
+
+    let mut results = Vec::new();
+    let mut saved: Vec<kairos_core::DataPointSet> = Vec::new();
+    for (key, members) in groups {
+        let group: BTreeMap<String, String> = group_tags
+            .iter()
+            .zip(&key)
+            .map(|(t, v)| ((*t).clone(), v.clone()))
+            .collect();
+
+        let mut tags: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for member in &members {
+            for (k, v) in &member.tags {
+                let values = tags.entry(k.clone()).or_default();
+                if !values.contains(v) {
+                    values.push(v.clone());
+                }
+            }
+        }
+        let (ts, vals) = merge_columns(members);
+
+        let ctx = crate::QueryContext {
+            start_ms: query_start_ms,
+            end_ms: query_end_ms,
+            tz,
+            source_metric: metric.name.clone(),
+            group_tags: group.clone(),
+            save_sink: std::sync::Mutex::new(Vec::new()),
+        };
+        // First stage runs on columns; the (already aggregated, small)
+        // output flows through the rest of the chain as rows.
+        let mut specs = metric.aggregators.iter();
+        let first = aggregators::build(specs.next().expect("checked above"), fast)?;
+        let mut points = first.run_columns(&ctx, &ts, &vals);
+        for spec in specs {
+            let aggregator = aggregators::build(spec, fast)?;
+            points = aggregator.run(&ctx, points);
+        }
+        saved.extend(ctx.save_sink.into_inner().expect("save sink poisoned"));
+
+        if metric.descending() {
+            points.reverse();
+        }
+
+        let mut group_by_entries = Vec::new();
+        if !group_tags.is_empty() {
+            group_by_entries.push(serde_json::json!({
+                "name": "tag",
+                "tags": group_tags,
+                "group": group,
+            }));
+        }
+        results.push(GroupResult { group, tags, group_by_entries, points });
+    }
+    Ok((results, saved))
+}
+
+/// Merges sorted column series into one sorted (ts, vals) pair. The single
+/// series case (the common one after tag grouping) is a move.
+fn merge_columns(mut members: Vec<kairos_core::ColumnSeries>) -> (Vec<i64>, Vec<f64>) {
+    if members.len() == 1 {
+        let only = members.pop().expect("len checked");
+        return (only.timestamps, only.values);
+    }
+    let total: usize = members.iter().map(|m| m.timestamps.len()).sum();
+    let mut pairs: Vec<(i64, f64)> = Vec::with_capacity(total);
+    for m in members {
+        pairs.extend(m.timestamps.into_iter().zip(m.values));
+    }
+    pairs.sort_unstable_by_key(|(ts, _)| *ts);
+    pairs.into_iter().unzip()
+}
+
 /// One stored series fed into query execution.
 #[derive(Debug, Clone)]
 pub struct SeriesInput {
@@ -609,6 +726,69 @@ mod tests {
             .map(|r| r.group_by_entries[0]["group"]["bin_number"].as_i64().unwrap())
             .collect();
         assert_eq!(ids, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn columnar_path_matches_row_path() {
+        let metric = parse_metric(
+            r#"{"name": "m", "group_by": [{"name": "tag", "tags": ["host"]}],
+                "aggregators": [
+                  {"name": "sum", "sampling": {"value": 100, "unit": "milliseconds"},
+                   "align_sampling": false},
+                  {"name": "scale", "factor": 2.0}]}"#,
+        );
+        let cols = vec![
+            kairos_core::ColumnSeries {
+                tags: [("host".to_string(), "a".to_string())].into(),
+                timestamps: vec![1, 2, 150],
+                values: vec![1.0, 2.0, 3.0],
+            },
+            kairos_core::ColumnSeries {
+                tags: [("host".to_string(), "a".to_string()), ("dc".to_string(), "x".to_string())].into(),
+                timestamps: vec![5],
+                values: vec![10.0],
+            },
+        ];
+        let rows: Vec<SeriesInput> = cols
+            .iter()
+            .map(|c| SeriesInput { tags: c.tags.clone(), points: c.to_points() })
+            .collect();
+        let (col_results, _) = execute_columnar(
+            &metric, cols, 0, i64::MAX, kairos_core::time::UTC, false,
+        )
+        .unwrap();
+        let (row_results, _) =
+            execute(&metric, rows, 0, i64::MAX, kairos_core::time::UTC, false).unwrap();
+        assert_eq!(col_results.len(), row_results.len());
+        for (c, r) in col_results.iter().zip(&row_results) {
+            assert_eq!(c.points, r.points);
+            assert_eq!(c.tags, r.tags);
+            assert_eq!(c.group_by_entries, r.group_by_entries);
+        }
+        // Sanity on the math: bucket [0,100): 1+2+10=13 *2; [100,200): 3*2.
+        assert_eq!(col_results[0].points[0].value, kairos_core::Value::Double(26.0));
+        assert_eq!(col_results[0].points[1].value, kairos_core::Value::Double(6.0));
+    }
+
+    #[test]
+    fn columnar_falls_back_for_first_aggregator() {
+        // `first` preserves value types, so it must take the row path; the
+        // fallback still produces correct (double-widened) results.
+        let metric = parse_metric(
+            r#"{"name": "m", "aggregators": [
+                {"name": "first", "sampling": {"value": 100, "unit": "milliseconds"},
+                 "align_sampling": false}]}"#,
+        );
+        let cols = vec![kairos_core::ColumnSeries {
+            tags: Default::default(),
+            timestamps: vec![1, 2],
+            values: vec![7.0, 8.0],
+        }];
+        let (results, _) = execute_columnar(
+            &metric, cols, 0, i64::MAX, kairos_core::time::UTC, false,
+        )
+        .unwrap();
+        assert_eq!(results[0].points[0].value, kairos_core::Value::Double(7.0));
     }
 
     #[test]

@@ -76,10 +76,21 @@ plain Java-style deletes use driver microsecond timestamps that would
 shadow later writes, a quirk inherited from the Java implementation and
 kept on the public delete API for parity).
 
-Measured in this container: a 1.05M-point historical scan served from
-Parquet in ~520–610 ms vs ~1.0–1.2 s from Cassandra (~2x), in a 7 MB
-footprint (~7 bytes/point). Text/custom values stay in the hot store; the
-cold tier is numeric-only.
+Aggregated scans served entirely from the cold tier take the **columnar
+fast path**: the Parquet reader produces (timestamps, values) arrays that
+stream straight into the vector kernels — rows materialize only after
+aggregation collapses the data. Queries that need row semantics (raw
+values, `first`/`last` type preservation, `limit`, point-level group-bys)
+fall back transparently, and the columnar results are verified equal to the
+row path. Compaction also purges fully-emptied row-key index entries (with
+millisecond tombstones) so the hot-emptiness check on historical scans
+stays cheap.
+
+Measured in this container: a 1.05M-point aggregated historical scan
+answers in **~85 ms (≈12 M pts/s)** through the full HTTP stack vs
+~1.0–2.1 s from Cassandra; the raw columnar scan runs at ~40 M pts/s. The
+data sits in a 7 MB footprint (~7 bytes/point). Text/custom values stay in
+the hot store; the cold tier is numeric-only.
 
 Profiling finding (`examples/profile_stages.rs`): with row-form
 `Vec<DataPoint>` input the pipeline is bound by point-struct memory traffic,
@@ -89,6 +100,19 @@ mid-query costs more than cheap kernels save. The kernels therefore run
 where they pay (`dev`-fast, `percentile`) and stand ready for the planned
 columnar-at-rest (Arrow/Parquet) tier, where data arrives contiguous and the
 G-vals/s rates apply directly.
+
+## Control plane
+
+- `GET /metrics`: Prometheus counters (ingest/query/compaction/WAL replay
+  totals, query wall time, columnar-path hits) plus uptime.
+- `GET /api/v1/health/check` + `/health/status`: liveness for LBs/probes.
+- `POST /api/v1/admin/compact`: manual tier compaction;
+  `KAIROSD_COMPACT_OLDER_THAN_MS` for the hourly background loop.
+- SIGTERM/SIGINT: graceful shutdown (stop accepting, WAL already fsynced on
+  a 100 ms cadence; unflushed ingest replays on restart).
+- All configuration is environment variables (documented in `kairosd`'s
+  main.rs header). No config file, auth/TLS termination, or per-query
+  resource limits yet — front with a proxy for those.
 
 ## Running
 

@@ -18,6 +18,7 @@
 
 mod api;
 mod features;
+mod metrics;
 mod ingest;
 mod rollup;
 mod store;
@@ -39,6 +40,7 @@ use store::AnyDatastore;
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
+    metrics::mark_start();
 
     let backend = std::env::var("KAIROSD_DATASTORE").unwrap_or_else(|_| "memory".to_string());
     let parquet = std::env::var("KAIROSD_PARQUET_DIR").ok().map(|dir| {
@@ -138,5 +140,27 @@ async fn main() {
         .await
         .unwrap_or_else(|e| panic!("cannot bind {addr}: {e}"));
     tracing::info!("kairosd listening on {addr}");
-    axum::serve(listener, app).await.expect("server failed");
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .expect("server failed");
+    tracing::info!("shutdown complete");
+}
+
+/// SIGINT/SIGTERM stop accepting connections; the WAL fsync loop has
+/// already made queued ingest durable, so replay covers the rest.
+async fn shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler");
+        tokio::select! {
+            _ = ctrl_c => {},
+            _ = term.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    ctrl_c.await.expect("install ctrl-c handler");
+    tracing::info!("shutdown signal received");
 }

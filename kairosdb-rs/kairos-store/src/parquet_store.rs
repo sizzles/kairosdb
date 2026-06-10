@@ -74,6 +74,77 @@ fn schema() -> Arc<Schema> {
     ]))
 }
 
+/// Typed views over one record batch's columns.
+struct BatchColumns<'a> {
+    series: &'a DictionaryArray<Int32Type>,
+    series_values: &'a StringArray,
+    ts: &'a Int64Array,
+    longs: &'a Int64Array,
+    doubles: &'a Float64Array,
+}
+
+impl<'a> BatchColumns<'a> {
+    fn new(batch: &'a RecordBatch) -> Result<Self> {
+        let series = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int32Type>>()
+            .ok_or_else(|| pq_err("series column", "not a dictionary"))?;
+        Ok(BatchColumns {
+            series,
+            series_values: series
+                .values()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| pq_err("series column", "not utf8"))?,
+            ts: batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| pq_err("ts column", "not int64"))?,
+            longs: batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| pq_err("long column", "not int64"))?,
+            doubles: batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| pq_err("double column", "not float64"))?,
+        })
+    }
+
+}
+
+/// Row groups whose ts statistics overlap [start, end].
+fn prune_row_groups<T: parquet::file::reader::ChunkReader>(
+    builder: &ParquetRecordBatchReaderBuilder<T>,
+    start_ms: i64,
+    end_ms: i64,
+) -> Vec<usize> {
+    builder
+        .metadata()
+        .row_groups()
+        .iter()
+        .enumerate()
+        .filter(|(_, rg)| {
+            let Some(stats) = rg.column(1).statistics() else { return true };
+            let min = stats
+                .min_bytes_opt()
+                .map(|b| i64::from_le_bytes(b.try_into().unwrap_or([0; 8])));
+            let max = stats
+                .max_bytes_opt()
+                .map(|b| i64::from_le_bytes(b.try_into().unwrap_or([0; 8])));
+            match (min, max) {
+                (Some(min), Some(max)) => max >= start_ms && min <= end_ms,
+                _ => true,
+            }
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
 impl ParquetStore {
     pub fn open(dir: impl AsRef<Path>) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
@@ -237,33 +308,106 @@ impl ParquetStore {
         end_ms: i64,
         tag_filter: &std::collections::HashMap<String, Vec<String>>,
     ) -> Result<Vec<SeriesData>> {
+        // Row form is derived from the columnar scan, preserving the
+        // long/double distinction via a parallel pass.
+        self.scan_file_rows(path, start_ms, end_ms, tag_filter)
+    }
+
+    /// Columnar time-range scan: per-series (timestamps, values) arrays
+    /// fed directly to the vector kernels — no row materialization. Longs
+    /// widen to f64, exactly as the aggregators' `as_f64` view does.
+    pub fn scan_columns(&self, query: &DatastoreQuery) -> Result<Vec<kairos_core::ColumnSeries>> {
+        let mut merged: BTreeMap<Tags, (Vec<i64>, Vec<f64>)> = BTreeMap::new();
+        for window in self.partitions(&query.metric, query.start_time_ms, query.end_time_ms)? {
+            let path = self.partition_path(&query.metric, window);
+            let file = fs::File::open(&path).map_err(|e| pq_err("open", e))?;
+            let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(
+                file,
+                ArrowReaderOptions::new(),
+            )
+            .map_err(|e| pq_err("reader", e))?;
+            let pruned = prune_row_groups(&builder, query.start_time_ms, query.end_time_ms);
+            let reader = builder
+                .with_row_groups(pruned)
+                .build()
+                .map_err(|e| pq_err("build reader", e))?;
+
+            // Rows are series-contiguous: track the dictionary key id and
+            // only do string/tag work when it changes; points accumulate
+            // into a run that flushes on series change.
+            let mut run: Option<(Tags, bool, Vec<i64>, Vec<f64>)> = None;
+            for batch in reader {
+                let batch = batch.map_err(|e| pq_err("read batch", e))?;
+                let cols = BatchColumns::new(&batch)?;
+                let mut current_id: Option<usize> = None; // ids are per-batch
+                for row in 0..batch.num_rows() {
+                    let id = cols.series.key(row).expect("non-null key");
+                    if current_id != Some(id) {
+                        current_id = Some(id);
+                        let key = cols.series_values.value(id);
+                        let changed = run
+                            .as_ref()
+                            .is_none_or(|(tags, ..)| tag_string(tags) != key);
+                        if changed {
+                            if let Some((tags, keep, ts, vals)) = run.take() {
+                                if keep && !ts.is_empty() {
+                                    let slot = merged.entry(tags).or_default();
+                                    slot.0.extend(ts);
+                                    slot.1.extend(vals);
+                                }
+                            }
+                            let tags = parse_tag_string(key);
+                            let keep = tags_match(&tags, &query.tags);
+                            run = Some((tags, keep, Vec::new(), Vec::new()));
+                        }
+                    }
+                    let (_, keep, ts_acc, val_acc) = run.as_mut().expect("set above");
+                    if !*keep {
+                        continue;
+                    }
+                    let t = cols.ts.value(row);
+                    if t < query.start_time_ms || t > query.end_time_ms {
+                        continue;
+                    }
+                    ts_acc.push(t);
+                    val_acc.push(if cols.longs.is_valid(row) {
+                        cols.longs.value(row) as f64
+                    } else {
+                        cols.doubles.value(row)
+                    });
+                }
+            }
+            if let Some((tags, keep, ts, vals)) = run.take() {
+                if keep && !ts.is_empty() {
+                    let slot = merged.entry(tags).or_default();
+                    slot.0.extend(ts);
+                    slot.1.extend(vals);
+                }
+            }
+        }
+        Ok(merged
+            .into_iter()
+            .filter(|(_, (ts, _))| !ts.is_empty())
+            .map(|(tags, (timestamps, values))| kairos_core::ColumnSeries {
+                tags,
+                timestamps,
+                values,
+            })
+            .collect())
+    }
+
+    fn scan_file_rows(
+        &self,
+        path: &Path,
+        start_ms: i64,
+        end_ms: i64,
+        tag_filter: &std::collections::HashMap<String, Vec<String>>,
+    ) -> Result<Vec<SeriesData>> {
         let file = fs::File::open(path).map_err(|e| pq_err("open", e))?;
         let builder =
             ParquetRecordBatchReaderBuilder::try_new_with_options(file, ArrowReaderOptions::new())
                 .map_err(|e| pq_err("reader", e))?;
-
-        // Row-group pruning on the ts column statistics.
-        let pruned: Vec<usize> = builder
-            .metadata()
-            .row_groups()
-            .iter()
-            .enumerate()
-            .filter(|(_, rg)| {
-                let Some(stats) = rg.column(1).statistics() else { return true };
-                let min = stats
-                    .min_bytes_opt()
-                    .map(|b| i64::from_le_bytes(b.try_into().unwrap_or([0; 8])));
-                let max = stats
-                    .max_bytes_opt()
-                    .map(|b| i64::from_le_bytes(b.try_into().unwrap_or([0; 8])));
-                match (min, max) {
-                    (Some(min), Some(max)) => max >= start_ms && min <= end_ms,
-                    _ => true,
-                }
-            })
-            .map(|(i, _)| i)
-            .collect();
-
+        let pruned = prune_row_groups(&builder, start_ms, end_ms);
         let reader = builder
             .with_row_groups(pruned)
             .build()
@@ -271,55 +415,33 @@ impl ParquetStore {
 
         let mut out: Vec<SeriesData> = Vec::new();
         let mut skip_series = false;
+        let mut current_key: Option<String> = None;
         for batch in reader {
             let batch = batch.map_err(|e| pq_err("read batch", e))?;
-            let series = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<DictionaryArray<Int32Type>>()
-                .ok_or_else(|| pq_err("series column", "not a dictionary"))?;
-            let series_values = series
-                .values()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| pq_err("series column", "not utf8"))?;
-            let ts = batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| pq_err("ts column", "not int64"))?;
-            let longs = batch
-                .column(2)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| pq_err("long column", "not int64"))?;
-            let doubles = batch
-                .column(3)
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| pq_err("double column", "not float64"))?;
-
+            let cols = BatchColumns::new(&batch)?;
+            let mut current_id: Option<usize> = None; // ids are per-batch
             for row in 0..batch.num_rows() {
-                let t = ts.value(row);
-                // Rows are series-contiguous; detect series changes by key.
-                let key = series_values.value(series.key(row).expect("non-null key"));
-                let same_series = out
-                    .last()
-                    .is_some_and(|s: &SeriesData| tag_string(&s.tags) == key);
-                if !same_series {
-                    let tags = parse_tag_string(key);
-                    skip_series = !tags_match(&tags, tag_filter);
-                    if !skip_series {
-                        out.push(SeriesData { tags, points: Vec::new() });
+                let id = cols.series.key(row).expect("non-null key");
+                if current_id != Some(id) {
+                    current_id = Some(id);
+                    let key = cols.series_values.value(id);
+                    if current_key.as_deref() != Some(key) {
+                        current_key = Some(key.to_string());
+                        let tags = parse_tag_string(key);
+                        skip_series = !tags_match(&tags, tag_filter);
+                        if !skip_series {
+                            out.push(SeriesData { tags, points: Vec::new() });
+                        }
                     }
                 }
+                let t = cols.ts.value(row);
                 if skip_series || t < start_ms || t > end_ms {
                     continue;
                 }
-                let value = if longs.is_valid(row) {
-                    Value::Long(longs.value(row))
+                let value = if cols.longs.is_valid(row) {
+                    Value::Long(cols.longs.value(row))
                 } else {
-                    Value::Double(doubles.value(row))
+                    Value::Double(cols.doubles.value(row))
                 };
                 out.last_mut()
                     .expect("series pushed above")

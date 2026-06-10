@@ -78,6 +78,7 @@ pub struct CassandraDatastore {
     ps_data_points_query: PreparedStatement,
     ps_data_points_delete_range: PreparedStatement,
     ps_data_points_delete_range_at: PreparedStatement,
+    ps_row_key_delete: PreparedStatement,
     ps_string_index_query: PreparedStatement,
 }
 
@@ -255,6 +256,11 @@ impl CassandraDatastore {
             .await?,
             ps_string_index_query: prepare("SELECT column1 FROM string_index WHERE key = ?")
                 .await?,
+            ps_row_key_delete: prepare(
+                "DELETE FROM row_keys WHERE metric = ? AND table_name = ? \
+                 AND row_time = ? AND data_type = ? AND tags = ?",
+            )
+            .await?,
             session,
             spec,
         })
@@ -343,11 +349,16 @@ impl CassandraDatastore {
                     .map_err(|e| store_err("row_keys rows", e))?;
                 let mut row_keys = Vec::new();
                 for key_row in keys
-                    .rows::<(CqlTimestamp, String, HashMap<String, String>)>()
+                    .rows::<(CqlTimestamp, Option<String>, Option<HashMap<String, String>>)>()
                     .map_err(|e| store_err("row_keys decode", e))?
                 {
                     let (row_time, data_type, tags) =
                         key_row.map_err(|e| store_err("row_keys row", e))?;
+                    // A static-only phantom row (all clustering rows deleted,
+                    // static mtime survives) has null data_type/tags.
+                    let (Some(data_type), Some(tags)) = (data_type, tags) else {
+                        continue;
+                    };
                     let tags: Tags = tags.into_iter().collect();
                     if tags_match(&tags, &query.tags) {
                         row_keys.push(DataPointsRowKey {
@@ -611,6 +622,38 @@ impl Datastore for CassandraDatastore {
 
     async fn delete_at(&self, query: &DatastoreQuery, timestamp_ms: i64) -> Result<()> {
         self.delete_impl(query, Some(timestamp_ms)).await
+    }
+
+    /// Drops `row_keys` entries for row windows fully covered by the query
+    /// (the Java server leaves such orphans behind too; its repair tooling
+    /// cleans them). The `row_key_time_index` entry stays — it is one row
+    /// per (metric, window) and keeps later writes cheap.
+    async fn purge_index(&self, query: &DatastoreQuery) -> Result<()> {
+        if !query.tags.is_empty() {
+            return Ok(()); // only whole-window purges are safe
+        }
+        for row_key in self.matching_row_keys(query).await? {
+            let fully_covered = query.start_time_ms <= row_key.row_time_ms
+                && query.end_time_ms >= row_key.row_time_ms + self.spec.row_width_ms() - 1;
+            if !fully_covered {
+                continue;
+            }
+            let cql_tags: HashMap<String, String> = row_key.tags.clone().into_iter().collect();
+            self.session
+                .execute_unpaged(
+                    &self.ps_row_key_delete,
+                    (
+                        row_key.metric_name.as_str(),
+                        DATA_POINTS_TABLE,
+                        CqlTimestamp(row_key.row_time_ms),
+                        row_key.data_type.as_str(),
+                        &cql_tags,
+                    ),
+                )
+                .await
+                .map_err(|e| store_err("row_keys purge", e))?;
+        }
+        Ok(())
     }
 
     async fn metric_names(&self, prefix: Option<&str>) -> Result<Vec<String>> {

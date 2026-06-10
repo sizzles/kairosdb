@@ -41,6 +41,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/features", get(list_features))
         .route("/api/v1/features/{feature}", get(get_feature))
         .route("/api/v1/admin/compact", post(compact))
+        .route("/metrics", get(prometheus_metrics))
         .route("/api/v1/rollups", post(create_rollup).get(list_rollups))
         .route(
             "/api/v1/rollups/{id}",
@@ -61,6 +62,13 @@ impl IntoResponse for ApiError {
 
 fn bad_request(msg: impl Into<String>) -> ApiError {
     ApiError(StatusCode::BAD_REQUEST, msg.into())
+}
+
+async fn prometheus_metrics() -> ([(axum::http::HeaderName, &'static str); 1], String) {
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        crate::metrics::render(),
+    )
 }
 
 async fn version() -> Json<JsonValue> {
@@ -112,8 +120,10 @@ async fn add_datapoints(
         _ => return Err(bad_request("metric[0].name may not be empty")),
     };
 
+    crate::metrics::inc(&crate::metrics::INGEST_REQUESTS);
     for metric in metrics {
         let set = parse_metric(metric)?;
+        crate::metrics::add(&crate::metrics::DATAPOINTS_INGESTED, set.points.len() as u64);
         state
             .ingest
             .submit(set)
@@ -203,17 +213,30 @@ pub(crate) async fn run_metric_query(
     tz: chrono_tz::Tz,
     fast: bool,
 ) -> Result<(usize, Vec<GroupResult>, Vec<DataPointSet>), String> {
-    let series = store
-        .query(&DatastoreQuery {
-            metric: metric.name.clone(),
-            start_time_ms: start_ms,
-            end_time_ms: end_ms,
-            tags: metric.tag_filter(),
-            limit: metric.limit,
-            descending: metric.descending(),
-        })
-        .await
-        .map_err(|e| e.to_string())?;
+    let dq = DatastoreQuery {
+        metric: metric.name.clone(),
+        start_time_ms: start_ms,
+        end_time_ms: end_ms,
+        tags: metric.tag_filter(),
+        limit: metric.limit,
+        descending: metric.descending(),
+    };
+
+    // Zero-materialization path: aggregated scans served entirely from the
+    // Parquet tier stream columns straight into the kernels. Raw and
+    // limited queries need rows (value types, limit semantics).
+    if metric.limit.is_none() && !metric.aggregators.is_empty() {
+        if let Some(cols) = store.query_columns(&dq).await.map_err(|e| e.to_string())? {
+            crate::metrics::inc(&crate::metrics::COLUMNAR_QUERIES);
+            let sample_size: usize = cols.iter().map(|c| c.timestamps.len()).sum();
+            let (groups, saved) =
+                kairos_query::model::execute_columnar(metric, cols, start_ms, end_ms, tz, fast)
+                    .map_err(|e| e.to_string())?;
+            return Ok((sample_size, groups, saved));
+        }
+    }
+
+    let series = store.query(&dq).await.map_err(|e| e.to_string())?;
 
     let sample_size: usize = series.iter().map(|s| s.points.len()).sum();
     let inputs: Vec<SeriesInput> = series
@@ -229,6 +252,23 @@ pub(crate) async fn run_metric_query(
 async fn query_datapoints(
     State(state): State<AppState>,
     Json(request): Json<QueryRequest>,
+) -> Result<Json<JsonValue>, ApiError> {
+    let started = std::time::Instant::now();
+    crate::metrics::inc(&crate::metrics::QUERIES);
+    let result = query_datapoints_inner(state, request).await;
+    if result.is_err() {
+        crate::metrics::inc(&crate::metrics::QUERY_ERRORS);
+    }
+    crate::metrics::add(
+        &crate::metrics::QUERY_MILLIS,
+        started.elapsed().as_millis() as u64,
+    );
+    result
+}
+
+async fn query_datapoints_inner(
+    state: AppState,
+    request: QueryRequest,
 ) -> Result<Json<JsonValue>, ApiError> {
     let now_ms = chrono::Utc::now().timestamp_millis();
     let (start_ms, end_ms) = request
@@ -266,6 +306,7 @@ async fn query_datapoints(
             })
             .collect();
 
+        crate::metrics::add(&crate::metrics::QUERY_SAMPLE_POINTS, sample_size as u64);
         queries.push(json!({ "sample_size": sample_size, "results": results }));
     }
 
@@ -390,6 +431,8 @@ async fn compact(
         .compact(cutoff)
         .await
         .map_err(|e| bad_request(e.to_string()))?;
+    crate::metrics::inc(&crate::metrics::COMPACTIONS);
+    crate::metrics::add(&crate::metrics::POINTS_COMPACTED, moved as u64);
     Ok(Json(json!({ "moved": moved, "cutoff": cutoff })))
 }
 

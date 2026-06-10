@@ -24,6 +24,9 @@ impl RangeSubAggregator for SumSub {
     ) -> Vec<DataPoint> {
         vec![DataPoint::new(return_time, crate::columnar::sum(values, self.fast))]
     }
+    fn columnar_safe(&self) -> bool {
+        true
+    }
 }
 
 pub struct AvgSub {
@@ -52,6 +55,9 @@ impl RangeSubAggregator for AvgSub {
         let avg = crate::columnar::sum(values, self.fast) / values.len() as f64;
         vec![DataPoint::new(return_time, avg)]
     }
+    fn columnar_safe(&self) -> bool {
+        true
+    }
 }
 
 pub struct MinSub;
@@ -72,6 +78,9 @@ impl RangeSubAggregator for MinSub {
         _points: &[DataPoint],
     ) -> Vec<DataPoint> {
         vec![DataPoint::new(return_time, crate::columnar::min(values))]
+    }
+    fn columnar_safe(&self) -> bool {
+        true
     }
 }
 
@@ -94,6 +103,9 @@ impl RangeSubAggregator for MaxSub {
     ) -> Vec<DataPoint> {
         vec![DataPoint::new(return_time, crate::columnar::max(values))]
     }
+    fn columnar_safe(&self) -> bool {
+        true
+    }
 }
 
 pub struct CountSub;
@@ -101,6 +113,19 @@ pub struct CountSub;
 impl RangeSubAggregator for CountSub {
     fn aggregate(&self, return_time: i64, points: &[DataPoint]) -> Vec<DataPoint> {
         vec![DataPoint::new(return_time, Value::Long(points.len() as i64))]
+    }
+
+    fn aggregate_columnar(
+        &self,
+        return_time: i64,
+        values: &[f64],
+        _points: &[DataPoint],
+    ) -> Vec<DataPoint> {
+        vec![DataPoint::new(return_time, Value::Long(values.len() as i64))]
+    }
+
+    fn columnar_safe(&self) -> bool {
+        true
     }
 }
 
@@ -208,6 +233,10 @@ impl RangeSubAggregator for DevSub {
         vec![DataPoint::new(return_time, crate::columnar::dev(values, self.fast))]
     }
 
+    fn columnar_safe(&self) -> bool {
+        true
+    }
+
     fn wants_columnar(&self) -> bool {
         // The strict recurrence is sequential either way; the vectorized
         // two-pass beats row + extraction only in fast mode.
@@ -268,6 +297,10 @@ impl RangeSubAggregator for PercentileSub {
             }
         };
         vec![DataPoint::new(return_time, result)]
+    }
+
+    fn columnar_safe(&self) -> bool {
+        true
     }
 
     fn wants_columnar(&self) -> bool {

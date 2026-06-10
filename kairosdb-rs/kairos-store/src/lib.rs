@@ -10,7 +10,7 @@ pub mod wal;
 
 use std::collections::HashMap;
 
-use kairos_core::{DataPoint, DataPointSet, Tags};
+use kairos_core::{ColumnSeries, DataPoint, DataPointSet, Tags};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -88,6 +88,26 @@ pub trait Datastore: Send + Sync {
         &self,
         prefix: Option<&str>,
     ) -> impl std::future::Future<Output = Result<Vec<String>>> + Send;
+
+    /// Removes index entries for fully-emptied ranges (after compaction
+    /// deletes the data), so emptiness checks stay cheap. Writes re-create
+    /// index entries, so this is always safe. Default: no-op.
+    fn purge_index(
+        &self,
+        _query: &DatastoreQuery,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        async { Ok(()) }
+    }
+
+    /// Columnar scan, when this store can serve the whole range as
+    /// (timestamps, values) arrays — the zero-materialization Parquet path.
+    /// `None` means the caller must use the row form `query`.
+    fn query_columns(
+        &self,
+        _query: &DatastoreQuery,
+    ) -> impl std::future::Future<Output = Result<Option<Vec<ColumnSeries>>>> + Send {
+        async { Ok(None) }
+    }
 
     fn tag_names(&self) -> impl std::future::Future<Output = Result<Vec<String>>> + Send;
 

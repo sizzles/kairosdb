@@ -100,6 +100,16 @@ impl<H: Datastore> TieredDatastore<H> {
                 .expect("clock before epoch")
                 .as_millis() as i64;
             self.hot.delete_at(&query, now_ms).await?;
+            // Drop orphaned index entries for fully-compacted windows so
+            // the hot-emptiness check on reads stays cheap.
+            let mut purge = query.clone();
+            purge.end_time_ms = self
+                .cold
+                .window_start(cutoff_ms.saturating_sub(1))
+                .saturating_sub(1);
+            if purge.end_time_ms > purge.start_time_ms {
+                self.hot.purge_index(&purge).await?;
+            }
         }
         Ok(moved)
     }
@@ -155,6 +165,23 @@ impl<H: Datastore> Datastore for TieredDatastore<H> {
     async fn delete(&self, query: &DatastoreQuery) -> Result<()> {
         self.cold.delete(query)?;
         self.hot.delete(query).await
+    }
+
+    /// Columnar fast path: only when the hot tier has nothing in range, so
+    /// the result comes purely from Parquet (otherwise tier merging needs
+    /// rows and the caller falls back).
+    async fn query_columns(
+        &self,
+        query: &DatastoreQuery,
+    ) -> Result<Option<Vec<kairos_core::ColumnSeries>>> {
+        if !self.hot.query(query).await?.is_empty() {
+            return Ok(None);
+        }
+        let cols = self.cold.scan_columns(query)?;
+        if cols.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(cols))
     }
 
     async fn metric_names(&self, prefix: Option<&str>) -> Result<Vec<String>> {
