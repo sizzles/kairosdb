@@ -48,6 +48,10 @@ const TABLES: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS spec (
         spec_type text, name text, value text,
         PRIMARY KEY ((spec_type), name))",
+    "CREATE TABLE IF NOT EXISTS service_index (
+        service text, service_key text, key text,
+        mtime timeuuid static, value text,
+        PRIMARY KEY ((service, service_key), key))",
 ];
 
 pub struct CassandraConfig {
@@ -79,6 +83,10 @@ pub struct CassandraDatastore {
     ps_data_points_delete_range: PreparedStatement,
     ps_data_points_delete_range_at: PreparedStatement,
     ps_row_key_delete: PreparedStatement,
+    ps_service_insert: PreparedStatement,
+    ps_service_get: PreparedStatement,
+    ps_service_list: PreparedStatement,
+    ps_service_delete: PreparedStatement,
     ps_string_index_query: PreparedStatement,
 }
 
@@ -259,6 +267,26 @@ impl CassandraDatastore {
             ps_row_key_delete: prepare(
                 "DELETE FROM row_keys WHERE metric = ? AND table_name = ? \
                  AND row_time = ? AND data_type = ? AND tags = ?",
+            )
+            .await?,
+            // Java ClusterConnection's service_index statements.
+            ps_service_insert: prepare(
+                "INSERT INTO service_index (service, service_key, key, value, mtime) \
+                 VALUES (?, ?, ?, ?, now())",
+            )
+            .await?,
+            ps_service_get: prepare(
+                "SELECT value FROM service_index \
+                 WHERE service = ? AND service_key = ? AND key = ?",
+            )
+            .await?,
+            ps_service_list: prepare(
+                "SELECT key FROM service_index \
+                 WHERE service = ? AND service_key = ? ORDER BY key ASC",
+            )
+            .await?,
+            ps_service_delete: prepare(
+                "DELETE FROM service_index WHERE service = ? AND service_key = ? AND key = ?",
             )
             .await?,
             session,
@@ -670,5 +698,70 @@ impl Datastore for CassandraDatastore {
 
     async fn tag_values(&self) -> Result<Vec<String>> {
         self.query_string_index(ROW_KEY_TAG_VALUES).await
+    }
+
+    async fn service_set(
+        &self,
+        service: &str,
+        service_key: &str,
+        key: &str,
+        value: &str,
+    ) -> Result<()> {
+        self.session
+            .execute_unpaged(&self.ps_service_insert, (service, service_key, key, value))
+            .await
+            .map_err(|e| store_err("service_index insert", e))?;
+        Ok(())
+    }
+
+    async fn service_get(
+        &self,
+        service: &str,
+        service_key: &str,
+        key: &str,
+    ) -> Result<Option<String>> {
+        let result = self
+            .session
+            .execute_unpaged(&self.ps_service_get, (service, service_key, key))
+            .await
+            .map_err(|e| store_err("service_index get", e))?
+            .into_rows_result()
+            .map_err(|e| store_err("service_index rows", e))?;
+        let mut rows = result
+            .rows::<(Option<String>,)>()
+            .map_err(|e| store_err("service_index decode", e))?;
+        match rows.next() {
+            Some(row) => Ok(row.map_err(|e| store_err("service_index row", e))?.0),
+            None => Ok(None),
+        }
+    }
+
+    async fn service_list_keys(&self, service: &str, service_key: &str) -> Result<Vec<String>> {
+        let result = self
+            .session
+            .execute_unpaged(&self.ps_service_list, (service, service_key))
+            .await
+            .map_err(|e| store_err("service_index list", e))?
+            .into_rows_result()
+            .map_err(|e| store_err("service_index rows", e))?;
+        let mut keys = Vec::new();
+        for row in result
+            .rows::<(Option<String>,)>()
+            .map_err(|e| store_err("service_index decode", e))?
+        {
+            // Static-only phantom rows (all keys deleted) come back null.
+            if let Some(key) = row.map_err(|e| store_err("service_index row", e))?.0 {
+                keys.push(key);
+            }
+        }
+        Ok(keys)
+    }
+
+    async fn service_delete(&self, service: &str, service_key: &str, key: &str) -> Result<()> {
+        self.session
+            .execute_unpaged(&self.ps_service_delete, (service, service_key, key))
+            .await
+            .map_err(|e| store_err("service_index delete", e))?;
+        Ok(())
     }
 }

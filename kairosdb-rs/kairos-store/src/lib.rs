@@ -112,6 +112,46 @@ pub trait Datastore: Send + Sync {
     fn tag_names(&self) -> impl std::future::Future<Output = Result<Vec<String>>> + Send;
 
     fn tag_values(&self) -> impl std::future::Future<Output = Result<Vec<String>>> + Send;
+
+    // --- service key store (Java `ServiceKeyStore` / `service_index`) ---
+    // Shared key/value metadata used for rollup tasks and leases. Backends
+    // without shared storage keep it in memory (single-node semantics).
+
+    fn service_set(
+        &self,
+        _service: &str,
+        _service_key: &str,
+        _key: &str,
+        _value: &str,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        async { Err(Error::Datastore("service index not supported".into())) }
+    }
+
+    fn service_get(
+        &self,
+        _service: &str,
+        _service_key: &str,
+        _key: &str,
+    ) -> impl std::future::Future<Output = Result<Option<String>>> + Send {
+        async { Err(Error::Datastore("service index not supported".into())) }
+    }
+
+    fn service_list_keys(
+        &self,
+        _service: &str,
+        _service_key: &str,
+    ) -> impl std::future::Future<Output = Result<Vec<String>>> + Send {
+        async { Err(Error::Datastore("service index not supported".into())) }
+    }
+
+    fn service_delete(
+        &self,
+        _service: &str,
+        _service_key: &str,
+        _key: &str,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        async { Err(Error::Datastore("service index not supported".into())) }
+    }
 }
 
 pub(crate) fn tags_match(tags: &Tags, filter: &HashMap<String, Vec<String>>) -> bool {

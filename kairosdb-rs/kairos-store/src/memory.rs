@@ -13,6 +13,8 @@ use crate::{tags_match, Datastore, DatastoreQuery, Result, SeriesData};
 pub struct MemoryDatastore {
     // metric name -> distinct tag set -> timestamp -> value
     data: RwLock<HashMap<String, HashMap<Tags, BTreeMap<i64, Value>>>>,
+    // (service, service_key, key) -> value
+    services: RwLock<BTreeMap<(String, String, String), String>>,
 }
 
 impl MemoryDatastore {
@@ -108,6 +110,54 @@ impl Datastore for MemoryDatastore {
         values.sort();
         values.dedup();
         Ok(values)
+    }
+
+    async fn service_set(
+        &self,
+        service: &str,
+        service_key: &str,
+        key: &str,
+        value: &str,
+    ) -> Result<()> {
+        self.services.write().expect("lock poisoned").insert(
+            (service.to_string(), service_key.to_string(), key.to_string()),
+            value.to_string(),
+        );
+        Ok(())
+    }
+
+    async fn service_get(
+        &self,
+        service: &str,
+        service_key: &str,
+        key: &str,
+    ) -> Result<Option<String>> {
+        Ok(self
+            .services
+            .read()
+            .expect("lock poisoned")
+            .get(&(service.to_string(), service_key.to_string(), key.to_string()))
+            .cloned())
+    }
+
+    async fn service_list_keys(&self, service: &str, service_key: &str) -> Result<Vec<String>> {
+        Ok(self
+            .services
+            .read()
+            .expect("lock poisoned")
+            .keys()
+            .filter(|(s, sk, _)| s == service && sk == service_key)
+            .map(|(_, _, k)| k.clone())
+            .collect())
+    }
+
+    async fn service_delete(&self, service: &str, service_key: &str, key: &str) -> Result<()> {
+        self.services.write().expect("lock poisoned").remove(&(
+            service.to_string(),
+            service_key.to_string(),
+            key.to_string(),
+        ));
+        Ok(())
     }
 }
 

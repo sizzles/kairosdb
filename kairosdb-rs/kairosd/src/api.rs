@@ -12,6 +12,7 @@ use kairos_query::model::{GroupResult, MetricQuery, QueryRequest, SeriesInput};
 use kairos_store::{Datastore, DatastoreQuery};
 use serde_json::{json, Value as JsonValue};
 
+use crate::guard::QueryGuard;
 use crate::ingest::Ingest;
 use crate::rollup::{RollupError, RollupManager};
 use crate::store::AnyDatastore;
@@ -21,7 +22,8 @@ pub struct AppState {
     pub store: Arc<AnyDatastore>,
     pub ingest: Ingest,
     pub rollups: Arc<RollupManager>,
-    /// `KAIROSD_QUERY_MODE=fast` enables vectorized sum/avg/dev kernels
+    pub guard: Arc<QueryGuard>,
+    /// `query_mode = "fast"` enables vectorized sum/avg/dev kernels
     /// (last-ulp float divergence from Java); `compat` (default) stays
     /// bit-identical.
     pub fast_math: bool,
@@ -41,6 +43,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/features", get(list_features))
         .route("/api/v1/features/{feature}", get(get_feature))
         .route("/api/v1/admin/compact", post(compact))
+        .route("/api/v1/runningqueries", get(running_queries))
+        .route("/api/v1/killquery/{id}", delete(kill_query).post(kill_query))
         .route("/metrics", get(prometheus_metrics))
         .route("/api/v1/rollups", post(create_rollup).get(list_rollups))
         .route(
@@ -212,7 +216,16 @@ pub(crate) async fn run_metric_query(
     end_ms: i64,
     tz: chrono_tz::Tz,
     fast: bool,
+    max_points: Option<u64>,
 ) -> Result<(usize, Vec<GroupResult>, Vec<DataPointSet>), String> {
+    let check_budget = |sample: usize| -> Result<(), String> {
+        match max_points {
+            Some(max) if sample as u64 > max => Err(format!(
+                "query scanned {sample} points, exceeding the max_query_points limit of {max}"
+            )),
+            _ => Ok(()),
+        }
+    };
     let dq = DatastoreQuery {
         metric: metric.name.clone(),
         start_time_ms: start_ms,
@@ -229,6 +242,7 @@ pub(crate) async fn run_metric_query(
         if let Some(cols) = store.query_columns(&dq).await.map_err(|e| e.to_string())? {
             crate::metrics::inc(&crate::metrics::COLUMNAR_QUERIES);
             let sample_size: usize = cols.iter().map(|c| c.timestamps.len()).sum();
+            check_budget(sample_size)?;
             let (groups, saved) =
                 kairos_query::model::execute_columnar(metric, cols, start_ms, end_ms, tz, fast)
                     .map_err(|e| e.to_string())?;
@@ -239,6 +253,7 @@ pub(crate) async fn run_metric_query(
     let series = store.query(&dq).await.map_err(|e| e.to_string())?;
 
     let sample_size: usize = series.iter().map(|s| s.points.len()).sum();
+    check_budget(sample_size)?;
     let inputs: Vec<SeriesInput> = series
         .into_iter()
         .map(|s| SeriesInput { tags: s.tags, points: s.points })
@@ -255,7 +270,7 @@ async fn query_datapoints(
 ) -> Result<Json<JsonValue>, ApiError> {
     let started = std::time::Instant::now();
     crate::metrics::inc(&crate::metrics::QUERIES);
-    let result = query_datapoints_inner(state, request).await;
+    let result = query_datapoints_guarded(state, request).await;
     if result.is_err() {
         crate::metrics::inc(&crate::metrics::QUERY_ERRORS);
     }
@@ -264,6 +279,68 @@ async fn query_datapoints(
         started.elapsed().as_millis() as u64,
     );
     result
+}
+
+/// Applies the control plane to one query: a concurrency slot, a kill-able
+/// task, and a wall-clock budget.
+async fn query_datapoints_guarded(
+    state: AppState,
+    request: QueryRequest,
+) -> Result<Json<JsonValue>, ApiError> {
+    let summary = request
+        .metrics
+        .iter()
+        .map(|m| m.name.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let inner_state = state.clone();
+    let task = tokio::spawn(query_datapoints_inner(inner_state, request));
+    let abort = task.abort_handle();
+    let permit = state
+        .guard
+        .admit(summary, abort.clone())
+        .await
+        .map_err(|e| ApiError(StatusCode::SERVICE_UNAVAILABLE, e))?;
+
+    let joined = match state.guard.timeout {
+        Some(timeout) => match tokio::time::timeout(timeout, task).await {
+            Ok(joined) => joined,
+            Err(_) => {
+                abort.abort();
+                drop(permit);
+                return Err(ApiError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("query exceeded the {}ms time budget", timeout.as_millis()),
+                ));
+            }
+        },
+        None => task.await,
+    };
+    drop(permit);
+    match joined {
+        Ok(result) => result,
+        Err(e) if e.is_cancelled() => Err(ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "query was killed".to_string(),
+        )),
+        Err(e) => Err(ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    }
+}
+
+async fn running_queries(State(state): State<AppState>) -> Json<JsonValue> {
+    Json(JsonValue::Array(state.guard.running()))
+}
+
+async fn kill_query(
+    State(state): State<AppState>,
+    Path(id): Path<u64>,
+) -> Result<StatusCode, ApiError> {
+    if state.guard.kill(id) {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError(StatusCode::NOT_FOUND, format!("no running query {id}")))
+    }
 }
 
 async fn query_datapoints_inner(
@@ -280,10 +357,17 @@ async fn query_datapoints_inner(
 
     let mut queries = Vec::new();
     for metric in &request.metrics {
-        let (sample_size, groups, saved) =
-            run_metric_query(&state.store, metric, start_ms, end_ms, tz, state.fast_math)
-                .await
-                .map_err(bad_request)?;
+        let (sample_size, groups, saved) = run_metric_query(
+            &state.store,
+            metric,
+            start_ms,
+            end_ms,
+            tz,
+            state.fast_math,
+            state.guard.max_points,
+        )
+        .await
+        .map_err(bad_request)?;
         for set in saved {
             state
                 .ingest
@@ -469,7 +553,7 @@ async fn create_rollup(
     State(state): State<AppState>,
     Json(task): Json<JsonValue>,
 ) -> Result<Json<JsonValue>, ApiError> {
-    let stored = state.rollups.create(task)?;
+    let stored = state.rollups.create(task).await?;
     let id = stored["id"].as_str().unwrap_or_default();
     Ok(Json(json!({
         "id": id,
@@ -497,7 +581,7 @@ async fn delete_rollup(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    state.rollups.delete(&id)?;
+    state.rollups.delete(&id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -521,10 +605,28 @@ mod tests {
     use tower::ServiceExt;
 
     async fn memory_router() -> Router {
+        memory_router_with_limits(crate::config::LimitsConfig::default()).await
+    }
+
+    async fn memory_router_with_limits(limits: crate::config::LimitsConfig) -> Router {
         let store = Arc::new(AnyDatastore::Memory(MemoryDatastore::new()));
         let ingest = Ingest::start(None, store.clone()).await.unwrap();
-        let rollups = RollupManager::start(store.clone(), ingest.clone(), None, false);
-        router(AppState { store, ingest, rollups, fast_math: false })
+        let rollups = RollupManager::start(
+            store.clone(),
+            ingest.clone(),
+            None,
+            false,
+            "test-node".to_string(),
+            0,
+        )
+        .await;
+        router(AppState {
+            store,
+            ingest,
+            rollups,
+            guard: Arc::new(QueryGuard::new(&limits)),
+            fast_math: false,
+        })
     }
 
     /// Ingest is asynchronous; tests must let the consumer drain.
@@ -708,8 +810,22 @@ mod tests {
             kairos_store::tiered::TieredDatastore::new(MemoryDatastore::new(), cold),
         ));
         let ingest = Ingest::start(None, store.clone()).await.unwrap();
-        let rollups = RollupManager::start(store.clone(), ingest.clone(), None, false);
-        let app = router(AppState { store, ingest, rollups, fast_math: false });
+        let rollups = RollupManager::start(
+            store.clone(),
+            ingest.clone(),
+            None,
+            false,
+            "test-node".to_string(),
+            0,
+        )
+        .await;
+        let app = router(AppState {
+            store,
+            ingest,
+            rollups,
+            guard: Arc::new(QueryGuard::new(&Default::default())),
+            fast_math: false,
+        });
 
         send(
             &app,
@@ -737,6 +853,43 @@ mod tests {
         .await;
         assert_eq!(body["queries"][0]["results"][0]["values"][0][1], 4.0);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn query_point_budget_enforced() {
+        let app = memory_router_with_limits(crate::config::LimitsConfig {
+            max_query_points: 2,
+            ..Default::default()
+        })
+        .await;
+        send(
+            &app,
+            "POST",
+            "/api/v1/datapoints",
+            json!([{"name": "budget.m", "tags": {"h": "a"},
+                    "datapoints": [[1, 1.0], [2, 2.0], [3, 3.0]]}]),
+        )
+        .await;
+        settle().await;
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/api/v1/datapoints/query",
+            json!({"start_absolute": 0, "metrics": [{"name": "budget.m"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body["errors"][0].as_str().unwrap().contains("max_query_points"));
+    }
+
+    #[tokio::test]
+    async fn running_queries_and_kill_unknown() {
+        let app = memory_router().await;
+        let (status, body) = send(&app, "GET", "/api/v1/runningqueries", json!({})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.as_array().unwrap().is_empty());
+        let (status, _) = send(&app, "DELETE", "/api/v1/killquery/42", json!({})).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

@@ -98,4 +98,40 @@ impl Datastore for AnyDatastore {
             AnyDatastore::TieredCassandra(s) => s.tag_values().await,
         }
     }
+
+    async fn service_set(&self, service: &str, service_key: &str, key: &str, value: &str) -> Result<()> {
+        match self {
+            AnyDatastore::Memory(s) => s.service_set(service, service_key, key, value).await,
+            AnyDatastore::Cassandra(s) => s.service_set(service, service_key, key, value).await,
+            AnyDatastore::TieredMemory(s) => s.service_set(service, service_key, key, value).await,
+            AnyDatastore::TieredCassandra(s) => s.service_set(service, service_key, key, value).await,
+        }
+    }
+
+    async fn service_get(&self, service: &str, service_key: &str, key: &str) -> Result<Option<String>> {
+        match self {
+            AnyDatastore::Memory(s) => s.service_get(service, service_key, key).await,
+            AnyDatastore::Cassandra(s) => s.service_get(service, service_key, key).await,
+            AnyDatastore::TieredMemory(s) => s.service_get(service, service_key, key).await,
+            AnyDatastore::TieredCassandra(s) => s.service_get(service, service_key, key).await,
+        }
+    }
+
+    async fn service_list_keys(&self, service: &str, service_key: &str) -> Result<Vec<String>> {
+        match self {
+            AnyDatastore::Memory(s) => s.service_list_keys(service, service_key).await,
+            AnyDatastore::Cassandra(s) => s.service_list_keys(service, service_key).await,
+            AnyDatastore::TieredMemory(s) => s.service_list_keys(service, service_key).await,
+            AnyDatastore::TieredCassandra(s) => s.service_list_keys(service, service_key).await,
+        }
+    }
+
+    async fn service_delete(&self, service: &str, service_key: &str, key: &str) -> Result<()> {
+        match self {
+            AnyDatastore::Memory(s) => s.service_delete(service, service_key, key).await,
+            AnyDatastore::Cassandra(s) => s.service_delete(service, service_key, key).await,
+            AnyDatastore::TieredMemory(s) => s.service_delete(service, service_key, key).await,
+            AnyDatastore::TieredCassandra(s) => s.service_delete(service, service_key, key).await,
+        }
+    }
 }

@@ -103,16 +103,29 @@ G-vals/s rates apply directly.
 
 ## Control plane
 
+- **Config file**: TOML via `--config <path>` or `KAIROSD_CONFIG`
+  (`[datastore]`, `[parquet]`, `[limits]`, `[rollups]` sections; see
+  `kairosd/src/config.rs`); every `KAIROSD_*` env var still works as an
+  override.
+- **Query guards** (`[limits]`): `max_concurrent_queries` (slot wait bounded
+  by the timeout, then 503), `query_timeout_ms` (kills and 503s),
+  `max_query_points` (caps raw points scanned, 400). Plus
+  `GET /api/v1/runningqueries` and `DELETE /api/v1/killquery/{id}`.
+- **Multi-node rollups**: tasks live in the shared `service_index` under the
+  Java `_Rollups`/`Config` keys (a Java server on the same cluster sees the
+  same task list); nodes refresh on `rollups.refresh_seconds` and gate each
+  execution on a lease (`LeasesRs`) that fails over within ~2 execution
+  intervals of a node dying. Lease claims are last-write-wins; a rare double
+  execution rewrites identical save_as points.
 - `GET /metrics`: Prometheus counters (ingest/query/compaction/WAL replay
   totals, query wall time, columnar-path hits) plus uptime.
 - `GET /api/v1/health/check` + `/health/status`: liveness for LBs/probes.
 - `POST /api/v1/admin/compact`: manual tier compaction;
-  `KAIROSD_COMPACT_OLDER_THAN_MS` for the hourly background loop.
+  `parquet.compact_older_than_ms` for the hourly background loop.
 - SIGTERM/SIGINT: graceful shutdown (stop accepting, WAL already fsynced on
   a 100 ms cadence; unflushed ingest replays on restart).
-- All configuration is environment variables (documented in `kairosd`'s
-  main.rs header). No config file, auth/TLS termination, or per-query
-  resource limits yet — front with a proxy for those.
+- Still missing: auth/TLS (front with a proxy) and per-query memory caps
+  (the point budget is the proxy for that).
 
 ## Running
 
@@ -156,10 +169,8 @@ curl -X POST localhost:8080/api/v1/datapoints/query -d '{
 
 ## Not here yet (see the proposal)
 
-The `/api/v1/metadata` service-values API, distributed rollup assignment
-(rollups run on a single designated node; for multi-node deployments run
-rollups on one instance), admin/internal endpoints (`killquery`,
-`runningqueries`, `backfill`), and the `kairos-commodity` crate (reference
+The `/api/v1/metadata` service-values API, the `backfill` admin endpoint,
+and the `kairos-commodity` crate (reference
 data, OHLCV values, curve queries, continuous contracts). Known divergences:
 `percentile` is exact instead of reservoir-sampled past 1028 points;
 `rate`/`sampler` drop equal-timestamp pairs instead of erroring; descending

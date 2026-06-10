@@ -202,6 +202,22 @@ impl<H: Datastore> Datastore for TieredDatastore<H> {
     async fn tag_values(&self) -> Result<Vec<String>> {
         self.hot.tag_values().await
     }
+
+    async fn service_set(&self, service: &str, service_key: &str, key: &str, value: &str) -> Result<()> {
+        self.hot.service_set(service, service_key, key, value).await
+    }
+
+    async fn service_get(&self, service: &str, service_key: &str, key: &str) -> Result<Option<String>> {
+        self.hot.service_get(service, service_key, key).await
+    }
+
+    async fn service_list_keys(&self, service: &str, service_key: &str) -> Result<Vec<String>> {
+        self.hot.service_list_keys(service, service_key).await
+    }
+
+    async fn service_delete(&self, service: &str, service_key: &str, key: &str) -> Result<()> {
+        self.hot.service_delete(service, service_key, key).await
+    }
 }
 
 #[cfg(test)]

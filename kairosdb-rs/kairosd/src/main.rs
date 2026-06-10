@@ -1,23 +1,14 @@
 //! KairosDB-rs server: wire-compatible `/api/v1` REST endpoints from
 //! `org.kairosdb.core.http.rest.MetricsResource` and `RollUpResource`.
 //!
-//! Configuration via environment:
-//! - `KAIROSD_DATASTORE`: `memory` (default) or `cassandra`
-//! - `KAIROSD_CASSANDRA_NODE`: CQL contact point (default `127.0.0.1:9042`)
-//! - `KAIROSD_CASSANDRA_KEYSPACE`: keyspace name (default `kairosdb`)
-//! - `KAIROSD_DATA_DIR`: WAL + rollup task storage (default `./kairosd-data`,
-//!   `none` disables the WAL and rollup persistence)
-//! - `KAIROSD_LISTEN`: bind address (default `0.0.0.0:8080`)
-//! - `KAIROSD_TELNET_LISTEN`: telnet bind address (default `0.0.0.0:4242`,
-//!   `none` disables)
-//! - `KAIROSD_QUERY_MODE`: `compat` (default, bit-identical to Java) or
-//!   `fast` (vectorized sum/avg/dev kernels)
-//! - `KAIROSD_PARQUET_DIR`: enables the Parquet cold tier at this path
-//! - `KAIROSD_COMPACT_OLDER_THAN_MS`: auto-compact points older than this
-//!   every hour (requires the parquet tier)
+//! Configuration: a TOML file via `--config <path>` or `KAIROSD_CONFIG`,
+//! with `KAIROSD_*` environment variables overriding individual settings
+//! (see `config.rs` for the full schema and variable names).
 
 mod api;
+mod config;
 mod features;
+mod guard;
 mod metrics;
 mod ingest;
 mod rollup;
@@ -42,11 +33,11 @@ async fn main() {
     tracing_subscriber::fmt::init();
     metrics::mark_start();
 
-    let backend = std::env::var("KAIROSD_DATASTORE").unwrap_or_else(|_| "memory".to_string());
-    let parquet = std::env::var("KAIROSD_PARQUET_DIR").ok().map(|dir| {
-        Arc::new(ParquetStore::open(&dir).unwrap_or_else(|e| panic!("parquet open failed: {e}")))
+    let cfg = config::Config::load();
+    let parquet = cfg.parquet.dir.as_ref().map(|dir| {
+        Arc::new(ParquetStore::open(dir).unwrap_or_else(|e| panic!("parquet open failed: {e}")))
     });
-    let store = match backend.as_str() {
+    let store = match cfg.datastore.backend.as_str() {
         "memory" => {
             let hot = MemoryDatastore::new();
             match &parquet {
@@ -55,15 +46,13 @@ async fn main() {
             }
         }
         "cassandra" => {
-            let mut config = CassandraConfig::default();
-            if let Ok(node) = std::env::var("KAIROSD_CASSANDRA_NODE") {
-                config.node = node;
-            }
-            if let Ok(keyspace) = std::env::var("KAIROSD_CASSANDRA_KEYSPACE") {
-                config.keyspace = keyspace;
-            }
-            tracing::info!("connecting to cassandra at {}", config.node);
-            let hot = CassandraDatastore::connect(&config)
+            let cassandra = CassandraConfig {
+                node: cfg.datastore.cassandra_node.clone(),
+                keyspace: cfg.datastore.cassandra_keyspace.clone(),
+                ..CassandraConfig::default()
+            };
+            tracing::info!("connecting to cassandra at {}", cassandra.node);
+            let hot = CassandraDatastore::connect(&cassandra)
                 .await
                 .unwrap_or_else(|e| panic!("cassandra connect failed: {e}"));
             match &parquet {
@@ -73,17 +62,19 @@ async fn main() {
                 None => AnyDatastore::Cassandra(hot),
             }
         }
-        other => panic!("unknown KAIROSD_DATASTORE: {other}"),
+        other => panic!("unknown datastore backend: {other}"),
     };
     tracing::info!(
-        "datastore backend: {backend}{}",
-        if parquet.is_some() { " + parquet cold tier" } else { "" }
+        "datastore backend: {}{}, node id: {}",
+        cfg.datastore.backend,
+        if parquet.is_some() { " + parquet cold tier" } else { "" },
+        cfg.rollups.node_id,
     );
     let store = Arc::new(store);
 
-    if let Ok(older_than) = std::env::var("KAIROSD_COMPACT_OLDER_THAN_MS") {
-        let older_than: i64 = older_than.parse().expect("KAIROSD_COMPACT_OLDER_THAN_MS: ms");
-        assert!(store.is_tiered(), "auto-compaction requires KAIROSD_PARQUET_DIR");
+    if cfg.parquet.compact_older_than_ms > 0 {
+        let older_than = cfg.parquet.compact_older_than_ms;
+        assert!(store.is_tiered(), "auto-compaction requires parquet.dir");
         let compact_store = store.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
@@ -99,9 +90,9 @@ async fn main() {
         });
     }
 
-    let data_dir = std::env::var("KAIROSD_DATA_DIR").unwrap_or_else(|_| "kairosd-data".to_string());
+    let data_dir = cfg.data_dir.clone();
     let (wal, rollup_file) = if data_dir == "none" {
-        tracing::warn!("KAIROSD_DATA_DIR=none: WAL durability and rollup persistence disabled");
+        tracing::warn!("data_dir=none: WAL durability disabled");
         (None, None)
     } else {
         let dir = std::path::PathBuf::from(&data_dir);
@@ -109,10 +100,10 @@ async fn main() {
         (Some(Arc::new(wal)), Some(dir.join("rollups.json")))
     };
 
-    let fast_math = match std::env::var("KAIROSD_QUERY_MODE").as_deref() {
-        Ok("fast") => true,
-        Ok("compat") | Err(_) => false,
-        Ok(other) => panic!("unknown KAIROSD_QUERY_MODE: {other}"),
+    let fast_math = match cfg.query_mode.as_str() {
+        "fast" => true,
+        "compat" => false,
+        other => panic!("unknown query_mode: {other}"),
     };
     if fast_math {
         tracing::info!("query mode: fast (vectorized sum/avg/dev; last-ulp divergence from Java)");
@@ -121,10 +112,17 @@ async fn main() {
     let ingest = Ingest::start(wal, store.clone())
         .await
         .unwrap_or_else(|e| panic!("ingest start (wal replay) failed: {e}"));
-    let rollups = RollupManager::start(store.clone(), ingest.clone(), rollup_file, fast_math);
+    let rollups = RollupManager::start(
+        store.clone(),
+        ingest.clone(),
+        rollup_file,
+        fast_math,
+        cfg.rollups.node_id.clone(),
+        cfg.rollups.refresh_seconds,
+    )
+    .await;
 
-    let telnet_addr =
-        std::env::var("KAIROSD_TELNET_LISTEN").unwrap_or_else(|_| "0.0.0.0:4242".to_string());
+    let telnet_addr = cfg.telnet_listen.clone();
     if telnet_addr != "none" {
         let telnet_listener = tokio::net::TcpListener::bind(&telnet_addr)
             .await
@@ -133,9 +131,10 @@ async fn main() {
         tokio::spawn(telnet::serve(telnet_listener, ingest.clone()));
     }
 
-    let app = api::router(AppState { store, ingest, rollups, fast_math });
+    let guard = Arc::new(guard::QueryGuard::new(&cfg.limits));
+    let app = api::router(AppState { store, ingest, rollups, guard, fast_math });
 
-    let addr = std::env::var("KAIROSD_LISTEN").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+    let addr = cfg.listen.clone();
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .unwrap_or_else(|e| panic!("cannot bind {addr}: {e}"));
