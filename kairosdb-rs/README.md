@@ -80,7 +80,8 @@ curl -X POST localhost:8080/api/v1/datapoints/query -d '{
 - Range bucketing replicates `RangeAggregator` exactly, including the
   `align_sampling` day-boundary fallthrough quirk and `align_sampling`
   defaulting to true.
-- Calendar math is UTC-only for now; per-query time zones are a TODO.
+- Calendar math honors the query-level `time_zone` (IANA names), defaulting
+  to UTC; month/year buckets land on local-time boundaries as in Java.
 
 ## Not here yet (see the proposal)
 
