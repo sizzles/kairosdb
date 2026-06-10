@@ -10,15 +10,33 @@ with commodity-market-data extensions to follow.
 | Crate | Contents |
 |---|---|
 | `kairos-core` | Data model (`Value`, `DataPoint`, `DataPointSet`), the zig-zag varint value codec (byte-compatible with `org.kairosdb.util.Util`), time units and the `RangeAggregator` bucketing math |
-| `kairos-store` | `Datastore` trait, in-memory backend, and the Cassandra storage codec (`DataPointsRowKey` serializer and `RowSpec` column-time encoding, byte-compatible with the Java schema) |
+| `kairos-store` | `Datastore` trait, in-memory backend, and the **Cassandra backend** (`scylla` driver) using the Java schema: `data_points`, `row_keys`, `row_key_time_index`, `string_index`, `spec` |
 | `kairos-query` | Range-aggregation engine, built-in aggregators (`sum`, `avg`, `min`, `max`, `count`, `first`, `last`, `scale`, `diff`), tag group-by, and the wire-compatible query JSON model |
-| `kairosd` | Server binary: `/api/v1` REST endpoints (`datapoints`, `datapoints/query`, `metricnames`, `version`) on axum |
+| `kairosd` | Server binary: `/api/v1` REST endpoints (`datapoints`, `datapoints/query`, `metricnames`, `version`) on axum, backed by memory or Cassandra |
+
+## Verified storage-level interop with Java KairosDB
+
+The Cassandra backend has been cross-validated against the Java
+implementation (1.4.0-SNAPSHOT) running on the same Cassandra 4.1 keyspace:
+
+- data written through the Java server reads back identically through
+  `kairosd`, and vice versa;
+- the same aggregated, tag-grouped query returns identical results from both
+  servers.
+
+Row-key blobs, column-time encoding (legacy and modern), value encodings, and
+the `spec`-table row-format negotiation all match `ClusterConnection` /
+`CQLBatch` semantics.
 
 ## Running
 
 ```sh
-cargo run -p kairosd          # listens on 0.0.0.0:8080 (KAIROSD_LISTEN to override)
-cargo test --workspace
+cargo run -p kairosd          # in-memory backend, listens on 0.0.0.0:8080
+KAIROSD_DATASTORE=cassandra KAIROSD_CASSANDRA_NODE=127.0.0.1:9042 \
+  KAIROSD_CASSANDRA_KEYSPACE=kairosdb cargo run -p kairosd
+
+cargo test --workspace        # unit tests
+KAIROS_TEST_CASSANDRA=127.0.0.1:9042 cargo test --workspace   # + live integration test
 ```
 
 Ingest and query use the same JSON as the Java server:
@@ -51,6 +69,7 @@ curl -X POST localhost:8080/api/v1/datapoints/query -d '{
 
 ## Not here yet (see the proposal)
 
-Cassandra driver integration (`scylla`), Telnet ingest, WAL-backed ingest
-queue, rollups, remaining aggregators/group-bys, and the `kairos-commodity`
-crate (reference data, OHLCV values, curve queries, continuous contracts).
+Telnet ingest, WAL-backed ingest queue, rollups, remaining
+aggregators/group-bys, legacy (pre-1.1) value decoding, batched Cassandra
+writes, and the `kairos-commodity` crate (reference data, OHLCV values,
+curve queries, continuous contracts).

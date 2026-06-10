@@ -2,6 +2,7 @@
 //! `org.kairosdb.core.datastore.Datastore`.
 
 pub mod cassandra;
+pub mod cassandra_store;
 pub mod memory;
 
 use std::collections::HashMap;

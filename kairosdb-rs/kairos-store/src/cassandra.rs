@@ -140,45 +140,75 @@ fn parse_tag_string(tag_string: &str) -> Tags {
     tags
 }
 
-/// Column-time encoding within a row, mirroring `RowSpec`. The legacy format
-/// shifts the offset left one bit; the low bit was historically a long/double
-/// flag.
+/// Time unit of the column offsets within a row (`RowSpec.m_rowUnit`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowUnit {
+    Milliseconds,
+    Seconds,
+}
+
+/// Column-time encoding within a row, mirroring the Java `RowSpec`. The
+/// cluster's unit/width/legacy parameters live in the `spec` table; clusters
+/// created before that table existed use the legacy format, which shifts the
+/// offset left one bit (the low bit was historically a long/double flag).
 #[derive(Debug, Clone, Copy)]
 pub struct RowSpec {
-    pub row_width_ms: i64,
+    pub row_width: i64,
+    pub unit: RowUnit,
     pub legacy: bool,
 }
 
 impl Default for RowSpec {
+    /// The Java no-arg constructor: a legacy, 3-week, millisecond row.
     fn default() -> Self {
         RowSpec {
-            row_width_ms: DEFAULT_ROW_WIDTH_MS,
+            row_width: DEFAULT_ROW_WIDTH_MS,
+            unit: RowUnit::Milliseconds,
             legacy: true,
         }
     }
 }
 
 impl RowSpec {
+    pub fn row_width_ms(&self) -> i64 {
+        match self.unit {
+            RowUnit::Milliseconds => self.row_width,
+            RowUnit::Seconds => self.row_width * 1000,
+        }
+    }
+
     pub fn calculate_row_time(&self, timestamp_ms: i64) -> i64 {
-        // Matches Java: timestamp - (Math.abs(timestamp) % rowWidth)
-        timestamp_ms - (timestamp_ms.abs() % self.row_width_ms)
+        // Matches Java: timestamp - (Math.abs(timestamp) % rowWidth), which
+        // uses the raw width regardless of unit.
+        timestamp_ms - (timestamp_ms.abs() % self.row_width)
     }
 
     pub fn column_name(&self, row_time_ms: i64, timestamp_ms: i64) -> i32 {
-        let offset = (timestamp_ms - row_time_ms) as i32;
-        if self.legacy {
-            offset << 1
-        } else {
-            offset
+        let column_time = timestamp_ms - row_time_ms;
+        match self.unit {
+            RowUnit::Seconds => (column_time / 1000) as i32,
+            RowUnit::Milliseconds => {
+                let offset = column_time as i32;
+                if self.legacy {
+                    offset << 1
+                } else {
+                    offset
+                }
+            }
         }
     }
 
     pub fn column_timestamp(&self, row_time_ms: i64, column_name: i32) -> i64 {
-        let offset = if self.legacy {
-            // Java uses >>> (logical shift) here
-            ((column_name as u32) >> 1) as i64
-        } else {
-            column_name as i64
+        let offset = match self.unit {
+            RowUnit::Seconds => column_name as i64 * 1000,
+            RowUnit::Milliseconds => {
+                if self.legacy {
+                    // Java uses >>> (logical shift) here
+                    ((column_name as u32) >> 1) as i64
+                } else {
+                    column_name as i64
+                }
+            }
         };
         row_time_ms + offset
     }
@@ -251,6 +281,16 @@ mod tests {
         let col = spec.column_name(row_time, 1_900_000_000);
         assert_eq!(col, (1_900_000_000 - 1_814_400_000) << 1);
         assert_eq!(spec.column_timestamp(row_time, col), 1_900_000_000);
+    }
+
+    #[test]
+    fn row_spec_modern_column_is_raw_offset() {
+        let spec = RowSpec { legacy: false, ..RowSpec::default() };
+        // Offsets beyond i32::MAX wrap exactly like Java int arithmetic and
+        // still compare correctly as unsigned 4-byte blobs.
+        let col = spec.column_name(0, 1_641_600_000);
+        assert_eq!(col, 1_641_600_000);
+        assert_eq!(spec.column_timestamp(0, col), 1_641_600_000);
     }
 
     #[test]

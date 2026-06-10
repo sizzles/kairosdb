@@ -1,6 +1,5 @@
 //! `/api/v1` handlers, wire-compatible with the Java `MetricsResource`.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::State;
@@ -10,11 +9,12 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use kairos_core::{DataPoint, DataPointSet, Value};
 use kairos_query::model::{QueryRequest, SeriesInput};
-use kairos_store::memory::MemoryDatastore;
 use kairos_store::{Datastore, DatastoreQuery};
 use serde_json::{json, Value as JsonValue};
 
-type Store = Arc<MemoryDatastore>;
+use crate::store::AnyDatastore;
+
+type Store = Arc<AnyDatastore>;
 
 pub fn router(store: Store) -> Router {
     Router::new()
@@ -211,18 +211,18 @@ fn value_pair(point: &DataPoint) -> JsonValue {
     json!([point.timestamp_ms, value])
 }
 
-#[allow(dead_code)]
-fn tag_filter_type() -> HashMap<String, Vec<String>> {
-    HashMap::new()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
     use http_body_util::BodyExt;
+    use kairos_store::memory::MemoryDatastore;
     use tower::ServiceExt;
+
+    fn memory_router() -> Router {
+        router(Arc::new(AnyDatastore::Memory(MemoryDatastore::new())))
+    }
 
     async fn send(app: &Router, method: &str, uri: &str, body: JsonValue) -> (StatusCode, JsonValue) {
         let response = app
@@ -249,7 +249,7 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_and_query_roundtrip() {
-        let app = router(Arc::new(MemoryDatastore::new()));
+        let app = memory_router();
 
         let (status, _) = send(
             &app,
@@ -296,7 +296,7 @@ mod tests {
 
     #[tokio::test]
     async fn group_by_tag_returns_separate_results() {
-        let app = router(Arc::new(MemoryDatastore::new()));
+        let app = memory_router();
         send(
             &app,
             "POST",
@@ -326,7 +326,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_empty_metric_name() {
-        let app = router(Arc::new(MemoryDatastore::new()));
+        let app = memory_router();
         let (status, body) = send(
             &app,
             "POST",
