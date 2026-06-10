@@ -4,6 +4,8 @@
 pub mod cassandra;
 pub mod cassandra_store;
 pub mod memory;
+pub mod parquet_store;
+pub mod tiered;
 pub mod wal;
 
 use std::collections::HashMap;
@@ -68,6 +70,19 @@ pub trait Datastore: Send + Sync {
 
     fn delete(&self, query: &DatastoreQuery)
         -> impl std::future::Future<Output = Result<()>> + Send;
+
+    /// Delete with an explicit millisecond write timestamp. Cassandra
+    /// tombstones default to microsecond client timestamps (as in the Java
+    /// driver), which would shadow all later millisecond-stamped writes;
+    /// compaction uses this variant so corrections and backfills into
+    /// compacted ranges remain writable. Defaults to plain `delete`.
+    fn delete_at(
+        &self,
+        query: &DatastoreQuery,
+        _timestamp_ms: i64,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        self.delete(query)
+    }
 
     fn metric_names(
         &self,

@@ -5,8 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+arrow = "59.0.0"
 futures = "0.3.32"
 kairos-core = { path = "../kairos-core" }
+parquet = "59.0.0"
 scylla = "1.6.0"
 thiserror = { workspace = true }
 tokio = { workspace = true }

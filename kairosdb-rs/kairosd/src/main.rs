@@ -12,6 +12,9 @@
 //!   `none` disables)
 //! - `KAIROSD_QUERY_MODE`: `compat` (default, bit-identical to Java) or
 //!   `fast` (vectorized sum/avg/dev kernels)
+//! - `KAIROSD_PARQUET_DIR`: enables the Parquet cold tier at this path
+//! - `KAIROSD_COMPACT_OLDER_THAN_MS`: auto-compact points older than this
+//!   every hour (requires the parquet tier)
 
 mod api;
 mod features;
@@ -24,6 +27,8 @@ use std::sync::Arc;
 
 use kairos_store::cassandra_store::{CassandraConfig, CassandraDatastore};
 use kairos_store::memory::MemoryDatastore;
+use kairos_store::parquet_store::ParquetStore;
+use kairos_store::tiered::TieredDatastore;
 use kairos_store::wal::Wal;
 
 use api::AppState;
@@ -36,8 +41,17 @@ async fn main() {
     tracing_subscriber::fmt::init();
 
     let backend = std::env::var("KAIROSD_DATASTORE").unwrap_or_else(|_| "memory".to_string());
+    let parquet = std::env::var("KAIROSD_PARQUET_DIR").ok().map(|dir| {
+        Arc::new(ParquetStore::open(&dir).unwrap_or_else(|e| panic!("parquet open failed: {e}")))
+    });
     let store = match backend.as_str() {
-        "memory" => AnyDatastore::Memory(MemoryDatastore::new()),
+        "memory" => {
+            let hot = MemoryDatastore::new();
+            match &parquet {
+                Some(cold) => AnyDatastore::TieredMemory(TieredDatastore::new(hot, cold.clone())),
+                None => AnyDatastore::Memory(hot),
+            }
+        }
         "cassandra" => {
             let mut config = CassandraConfig::default();
             if let Ok(node) = std::env::var("KAIROSD_CASSANDRA_NODE") {
@@ -47,15 +61,41 @@ async fn main() {
                 config.keyspace = keyspace;
             }
             tracing::info!("connecting to cassandra at {}", config.node);
-            let datastore = CassandraDatastore::connect(&config)
+            let hot = CassandraDatastore::connect(&config)
                 .await
                 .unwrap_or_else(|e| panic!("cassandra connect failed: {e}"));
-            AnyDatastore::Cassandra(datastore)
+            match &parquet {
+                Some(cold) => {
+                    AnyDatastore::TieredCassandra(TieredDatastore::new(hot, cold.clone()))
+                }
+                None => AnyDatastore::Cassandra(hot),
+            }
         }
         other => panic!("unknown KAIROSD_DATASTORE: {other}"),
     };
-    tracing::info!("datastore backend: {backend}");
+    tracing::info!(
+        "datastore backend: {backend}{}",
+        if parquet.is_some() { " + parquet cold tier" } else { "" }
+    );
     let store = Arc::new(store);
+
+    if let Ok(older_than) = std::env::var("KAIROSD_COMPACT_OLDER_THAN_MS") {
+        let older_than: i64 = older_than.parse().expect("KAIROSD_COMPACT_OLDER_THAN_MS: ms");
+        assert!(store.is_tiered(), "auto-compaction requires KAIROSD_PARQUET_DIR");
+        let compact_store = store.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                tick.tick().await;
+                let cutoff = chrono::Utc::now().timestamp_millis() - older_than;
+                match compact_store.compact(cutoff).await {
+                    Ok(moved) if moved > 0 => tracing::info!("compacted {moved} points to parquet"),
+                    Ok(_) => {}
+                    Err(e) => tracing::error!("compaction failed: {e}"),
+                }
+            }
+        });
+    }
 
     let data_dir = std::env::var("KAIROSD_DATA_DIR").unwrap_or_else(|_| "kairosd-data".to_string());
     let (wal, rollup_file) = if data_dir == "none" {

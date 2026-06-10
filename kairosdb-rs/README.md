@@ -10,7 +10,7 @@ with commodity-market-data extensions to follow.
 | Crate | Contents |
 |---|---|
 | `kairos-core` | Data model (`Value`, `DataPoint`, `DataPointSet`), the zig-zag varint value codec (byte-compatible with `org.kairosdb.util.Util`), time units and the `RangeAggregator` bucketing math |
-| `kairos-store` | `Datastore` trait, in-memory backend, the **WAL** (segmented, CRC-checked, checkpointed), and the **Cassandra backend** (`scylla` driver, concurrent reads, batched writes) using the Java schema: `data_points`, `row_keys`, `row_key_time_index`, `string_index`, `spec` |
+| `kairos-store` | `Datastore` trait, in-memory backend, the **WAL** (segmented, CRC-checked, checkpointed), the **Cassandra backend** (`scylla` driver, concurrent reads, batched writes) using the Java schema, and the **Parquet cold tier** (time-partitioned columnar files + tiered hot/cold datastore with compaction) |
 | `kairos-query` | Range-aggregation engine; all 23 Java aggregators (`sum`, `avg`, `min`, `max`, `count`, `dev`, `percentile`, `first`, `last`, `scale`, `div`, `diff`, `rate`, `sma`, `filter`, `trim`, `pad`, `gaps`, `least_squares`, `sampler`, `score`, `time_diff`, `save_as`); group-bys `tag`, `time`, `value`, `bin`; `order: desc`; wire-compatible query JSON model |
 | `kairosd` | Server binary: `/api/v1` REST endpoints (`datapoints` incl. gzip, `datapoints/query`, `datapoints/query/tags`, `datapoints/delete`, `metric/{name}` delete, `metricnames?prefix=`, `health/check`, `health/status`, `features`, `rollups`, `version`) on axum; Telnet ingest (`put`/`putm`/`puts`/`version`, port 4242); durable ingest pipeline (WAL → queue → batched writes, replay on restart); rollup scheduler |
 
@@ -61,6 +61,25 @@ results differ from Java only by float reassociation (observed < 1e-9
 relative; the two-pass `dev` is numerically *better* than the recurrence).
 The default `compat` mode stays bit-identical to the Java server — the
 regression suite runs against it.
+
+## Parquet cold tier
+
+`KAIROSD_PARQUET_DIR` puts a columnar tier behind the hot store (memory or
+Cassandra). Writes land hot; `POST /api/v1/admin/compact`
+(`{"older_than_ms": N}`) — or hourly auto-compaction via
+`KAIROSD_COMPACT_OLDER_THAN_MS` — moves closed history into one Parquet file
+per (metric, 3-week window), sorted by series and timestamp with row-group
+statistics. Queries merge tiers transparently; hot wins timestamp
+collisions, so late corrections into compacted ranges behave correctly
+(compaction tombstones are millisecond-stamped for exactly this reason —
+plain Java-style deletes use driver microsecond timestamps that would
+shadow later writes, a quirk inherited from the Java implementation and
+kept on the public delete API for parity).
+
+Measured in this container: a 1.05M-point historical scan served from
+Parquet in ~520–610 ms vs ~1.0–1.2 s from Cassandra (~2x), in a 7 MB
+footprint (~7 bytes/point). Text/custom values stay in the hot store; the
+cold tier is numeric-only.
 
 Profiling finding (`examples/profile_stages.rs`): with row-form
 `Vec<DataPoint>` input the pipeline is bound by point-struct memory traffic,

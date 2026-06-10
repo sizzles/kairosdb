@@ -77,6 +77,7 @@ pub struct CassandraDatastore {
     ps_row_key_query: PreparedStatement,
     ps_data_points_query: PreparedStatement,
     ps_data_points_delete_range: PreparedStatement,
+    ps_data_points_delete_range_at: PreparedStatement,
     ps_string_index_query: PreparedStatement,
 }
 
@@ -247,6 +248,11 @@ impl CassandraDatastore {
                 "DELETE FROM data_points WHERE key = ? AND column1 >= ? AND column1 <= ?",
             )
             .await?,
+            ps_data_points_delete_range_at: prepare(
+                "DELETE FROM data_points USING TIMESTAMP ? \
+                 WHERE key = ? AND column1 >= ? AND column1 <= ?",
+            )
+            .await?,
             ps_string_index_query: prepare("SELECT column1 FROM string_index WHERE key = ?")
                 .await?,
             session,
@@ -376,6 +382,44 @@ impl CassandraDatastore {
             self.spec.column_name(row_time, query.end_time_ms) + 1
         };
         (start, end)
+    }
+
+    async fn delete_impl(
+        &self,
+        query: &DatastoreQuery,
+        timestamp_ms: Option<i64>,
+    ) -> Result<()> {
+        for row_key in self.matching_row_keys(query).await? {
+            let start_col = if query.start_time_ms < row_key.row_time_ms {
+                0
+            } else {
+                self.spec.column_name(row_key.row_time_ms, query.start_time_ms)
+            };
+            let end_col = self.spec.column_name(
+                row_key.row_time_ms,
+                query.end_time_ms.min(row_key.row_time_ms + self.spec.row_width_ms()),
+            );
+            let key = row_key.to_bytes();
+            let (start, end) = (start_col.to_be_bytes().to_vec(), end_col.to_be_bytes().to_vec());
+            match timestamp_ms {
+                // Java-identical: driver-assigned microsecond tombstone.
+                None => self
+                    .session
+                    .execute_unpaged(&self.ps_data_points_delete_range, (key, start, end))
+                    .await
+                    .map_err(|e| store_err("data_points delete", e))?,
+                // Compaction: millisecond tombstone so later writes win.
+                Some(ts) => self
+                    .session
+                    .execute_unpaged(
+                        &self.ps_data_points_delete_range_at,
+                        (ts, key, start, end),
+                    )
+                    .await
+                    .map_err(|e| store_err("data_points delete at", e))?,
+            };
+        }
+        Ok(())
     }
 
     async fn read_row(
@@ -562,29 +606,11 @@ impl Datastore for CassandraDatastore {
     }
 
     async fn delete(&self, query: &DatastoreQuery) -> Result<()> {
-        for row_key in self.matching_row_keys(query).await? {
-            let start_col = if query.start_time_ms < row_key.row_time_ms {
-                0
-            } else {
-                self.spec.column_name(row_key.row_time_ms, query.start_time_ms)
-            };
-            let end_col = self.spec.column_name(
-                row_key.row_time_ms,
-                query.end_time_ms.min(row_key.row_time_ms + self.spec.row_width_ms()),
-            );
-            self.session
-                .execute_unpaged(
-                    &self.ps_data_points_delete_range,
-                    (
-                        row_key.to_bytes(),
-                        start_col.to_be_bytes().to_vec(),
-                        end_col.to_be_bytes().to_vec(),
-                    ),
-                )
-                .await
-                .map_err(|e| store_err("data_points delete", e))?;
-        }
-        Ok(())
+        self.delete_impl(query, None).await
+    }
+
+    async fn delete_at(&self, query: &DatastoreQuery, timestamp_ms: i64) -> Result<()> {
+        self.delete_impl(query, Some(timestamp_ms)).await
     }
 
     async fn metric_names(&self, prefix: Option<&str>) -> Result<Vec<String>> {

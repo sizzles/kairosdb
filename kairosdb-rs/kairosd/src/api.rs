@@ -40,6 +40,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/health/status", get(health_status))
         .route("/api/v1/features", get(list_features))
         .route("/api/v1/features/{feature}", get(get_feature))
+        .route("/api/v1/admin/compact", post(compact))
         .route("/api/v1/rollups", post(create_rollup).get(list_rollups))
         .route(
             "/api/v1/rollups/{id}",
@@ -376,6 +377,22 @@ async fn health_status(State(state): State<AppState>) -> Json<JsonValue> {
     Json(json!([datastore, "Ingest-Queue: OK"]))
 }
 
+/// `POST /api/v1/admin/compact` `{"older_than_ms": N}` (default 0: compact
+/// everything up to now): moves hot points into the Parquet cold tier.
+async fn compact(
+    State(state): State<AppState>,
+    Json(body): Json<JsonValue>,
+) -> Result<Json<JsonValue>, ApiError> {
+    let older_than = body.get("older_than_ms").and_then(JsonValue::as_i64).unwrap_or(0);
+    let cutoff = chrono::Utc::now().timestamp_millis() - older_than;
+    let moved = state
+        .store
+        .compact(cutoff)
+        .await
+        .map_err(|e| bad_request(e.to_string()))?;
+    Ok(Json(json!({ "moved": moved, "cutoff": cutoff })))
+}
+
 async fn list_features() -> Json<JsonValue> {
     Json(crate::features::features())
 }
@@ -637,6 +654,46 @@ mod tests {
         assert_eq!(status, StatusCode::NO_CONTENT);
         let (status, _) = send(&app, "GET", &format!("/api/v1/rollups/{id}"), json!({})).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn tiered_compaction_via_admin_endpoint() {
+        let dir = std::env::temp_dir().join(format!("kairos-api-pq-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cold = Arc::new(kairos_store::parquet_store::ParquetStore::open(&dir).unwrap());
+        let store = Arc::new(AnyDatastore::TieredMemory(
+            kairos_store::tiered::TieredDatastore::new(MemoryDatastore::new(), cold),
+        ));
+        let ingest = Ingest::start(None, store.clone()).await.unwrap();
+        let rollups = RollupManager::start(store.clone(), ingest.clone(), None, false);
+        let app = router(AppState { store, ingest, rollups, fast_math: false });
+
+        send(
+            &app,
+            "POST",
+            "/api/v1/datapoints",
+            json!([{"name": "pq.m", "tags": {"h": "a"},
+                    "datapoints": [[1000, 1.5], [2000, 2.5]]}]),
+        )
+        .await;
+        settle().await;
+
+        let (status, body) = send(&app, "POST", "/api/v1/admin/compact", json!({})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["moved"], 2);
+
+        // Data still queryable, now served from the cold tier.
+        let (_, body) = send(
+            &app,
+            "POST",
+            "/api/v1/datapoints/query",
+            json!({"start_absolute": 0, "metrics": [{"name": "pq.m",
+                "aggregators": [{"name": "sum", "sampling": {"value": 1, "unit": "hours"},
+                                 "align_sampling": false}]}]}),
+        )
+        .await;
+        assert_eq!(body["queries"][0]["results"][0]["values"][0][1], 4.0);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
