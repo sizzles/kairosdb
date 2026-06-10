@@ -140,6 +140,44 @@ fn parse_tag_string(tag_string: &str) -> Tags {
     tags
 }
 
+/// Decode a legacy (pre-1.1) stored value. The column's low bit selects the
+/// type (`CassandraDatastore.LONG_FLAG` = 0): longs are big-endian with
+/// leading zero bytes stripped (an empty blob is 0), doubles carry a flag
+/// byte (0x1 = f32, 0x2 = f64) before the big-endian payload — the Java
+/// `ValueSerializer` format.
+pub fn decode_legacy_value(column_name: i32, bytes: &[u8]) -> Result<kairos_core::Value> {
+    use kairos_core::Value;
+    if column_name & 0x1 == 0 {
+        let mut value = 0i64;
+        for b in bytes {
+            value = (value << 8) | i64::from(*b);
+        }
+        Ok(Value::Long(value))
+    } else {
+        match bytes.first() {
+            Some(0x1) => {
+                let raw: [u8; 4] = bytes
+                    .get(1..5)
+                    .ok_or_else(|| Error::Datastore("legacy float truncated".into()))?
+                    .try_into()
+                    .expect("slice is 4 bytes");
+                Ok(Value::Double(f64::from(f32::from_be_bytes(raw))))
+            }
+            Some(0x2) => {
+                let raw: [u8; 8] = bytes
+                    .get(1..9)
+                    .ok_or_else(|| Error::Datastore("legacy double truncated".into()))?
+                    .try_into()
+                    .expect("slice is 8 bytes");
+                Ok(Value::Double(f64::from_be_bytes(raw)))
+            }
+            other => Err(Error::Datastore(format!(
+                "unknown legacy value flag: {other:?}"
+            ))),
+        }
+    }
+}
+
 /// Time unit of the column offsets within a row (`RowSpec.m_rowUnit`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowUnit {
@@ -291,6 +329,23 @@ mod tests {
         let col = spec.column_name(0, 1_641_600_000);
         assert_eq!(col, 1_641_600_000);
         assert_eq!(spec.column_timestamp(0, col), 1_641_600_000);
+    }
+
+    #[test]
+    fn legacy_value_decoding() {
+        use kairos_core::Value;
+        // Long: stripped big-endian; empty blob is the zero short-circuit.
+        assert_eq!(decode_legacy_value(0, &[]).unwrap(), Value::Long(0));
+        assert_eq!(decode_legacy_value(0, &[0x2A]).unwrap(), Value::Long(42));
+        assert_eq!(decode_legacy_value(0, &[0x01, 0x00]).unwrap(), Value::Long(256));
+        // Double: 0x2 flag + 8-byte IEEE-754.
+        let mut blob = vec![0x2];
+        blob.extend_from_slice(&1.5f64.to_be_bytes());
+        assert_eq!(decode_legacy_value(1, &blob).unwrap(), Value::Double(1.5));
+        // Float: 0x1 flag + 4 bytes.
+        let mut blob = vec![0x1];
+        blob.extend_from_slice(&2.5f32.to_be_bytes());
+        assert_eq!(decode_legacy_value(1, &blob).unwrap(), Value::Double(2.5));
     }
 
     #[test]

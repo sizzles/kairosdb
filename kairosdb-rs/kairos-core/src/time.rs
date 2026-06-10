@@ -3,10 +3,14 @@
 //! The range math reproduces `org.kairosdb.core.aggregator.RangeAggregator`
 //! exactly, including its quirks (e.g. `align_sampling` with an HOURS unit
 //! aligns to the start of the *day*, due to the Java switch fallthrough).
-//! Calendar math is UTC-only for now; per-query time zones are a TODO.
+//! Calendar math honors a per-query time zone (Java `TimezoneAware`),
+//! defaulting to UTC.
 
-use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Timelike, Utc};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Timelike};
+use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
+
+pub const UTC: Tz = chrono_tz::UTC;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -48,17 +52,26 @@ impl Sampling {
     }
 }
 
-fn utc(ts_ms: i64) -> DateTime<Utc> {
-    Utc.timestamp_millis_opt(ts_ms).single().expect("valid ms timestamp")
+fn in_tz(ts_ms: i64, tz: Tz) -> DateTime<Tz> {
+    tz.timestamp_millis_opt(ts_ms).single().unwrap_or_else(|| {
+        // DST gaps have no single representation; lean on the latest.
+        tz.timestamp_millis_opt(ts_ms)
+            .latest()
+            .expect("valid ms timestamp")
+    })
 }
 
 /// Add `n` units to a timestamp, matching Joda `DateTimeField.add` (months
 /// clamp the day-of-month: Jan 31 + 1 month = Feb 28).
 pub fn add_units(ts_ms: i64, unit: TimeUnit, n: i64) -> i64 {
+    add_units_tz(ts_ms, unit, n, UTC)
+}
+
+pub fn add_units_tz(ts_ms: i64, unit: TimeUnit, n: i64, tz: Tz) -> i64 {
     if let Some(width) = unit.fixed_millis() {
         return ts_ms + n * width;
     }
-    let dt = utc(ts_ms);
+    let dt = in_tz(ts_ms, tz);
     let total_months = match unit {
         TimeUnit::Months => i64::from(dt.year()) * 12 + i64::from(dt.month0()) + n,
         TimeUnit::Years => (i64::from(dt.year()) + n) * 12 + i64::from(dt.month0()),
@@ -70,18 +83,32 @@ pub fn add_units(ts_ms: i64, unit: TimeUnit, n: i64) -> i64 {
     let day = dt.day().min(last_day);
     let date = NaiveDate::from_ymd_opt(year, month0 + 1, day).expect("valid date");
     let time = dt.time();
-    Utc.from_utc_datetime(&date.and_time(time)).timestamp_millis()
+    match tz.from_local_datetime(&date.and_time(time)) {
+        chrono::LocalResult::Single(dt) | chrono::LocalResult::Ambiguous(dt, _) => {
+            dt.timestamp_millis()
+        }
+        // The local time falls into a DST gap; shift forward an hour.
+        chrono::LocalResult::None => tz
+            .from_local_datetime(&(date.and_time(time) + Duration::hours(1)))
+            .earliest()
+            .expect("valid shifted time")
+            .timestamp_millis(),
+    }
 }
 
 /// Whole units between `subtrahend` and `minuend`, matching Joda
 /// `DateTimeField.getDifferenceAsLong`: the largest `d` (toward zero) such
 /// that adding `d` units to `subtrahend` does not pass `minuend`.
 pub fn unit_difference(minuend_ms: i64, subtrahend_ms: i64, unit: TimeUnit) -> i64 {
+    unit_difference_tz(minuend_ms, subtrahend_ms, unit, UTC)
+}
+
+pub fn unit_difference_tz(minuend_ms: i64, subtrahend_ms: i64, unit: TimeUnit, tz: Tz) -> i64 {
     if let Some(width) = unit.fixed_millis() {
         return (minuend_ms - subtrahend_ms) / width; // truncates toward zero, like Java
     }
-    let dt_min = utc(minuend_ms);
-    let dt_sub = utc(subtrahend_ms);
+    let dt_min = in_tz(minuend_ms, tz);
+    let dt_sub = in_tz(subtrahend_ms, tz);
     let mut estimate = match unit {
         TimeUnit::Months => {
             (i64::from(dt_min.year()) * 12 + i64::from(dt_min.month0()))
@@ -93,11 +120,11 @@ pub fn unit_difference(minuend_ms: i64, subtrahend_ms: i64, unit: TimeUnit) -> i
     // Correct the estimate so add(subtrahend, d) <= minuend < add(subtrahend, d+1)
     // (mirrored for negative differences).
     if minuend_ms >= subtrahend_ms {
-        while add_units(subtrahend_ms, unit, estimate) > minuend_ms {
+        while add_units_tz(subtrahend_ms, unit, estimate, tz) > minuend_ms {
             estimate -= 1;
         }
     } else {
-        while add_units(subtrahend_ms, unit, estimate) < minuend_ms {
+        while add_units_tz(subtrahend_ms, unit, estimate, tz) < minuend_ms {
             estimate += 1;
         }
     }
@@ -117,7 +144,11 @@ fn days_in_month(year: i32, month: u32) -> u32 {
 /// `RangeAggregator.alignRangeBoundary` (including the DAYS..SECONDS
 /// fallthrough that aligns all of them to start of day).
 pub fn align_range_boundary(ts_ms: i64, unit: TimeUnit) -> i64 {
-    let dt = utc(ts_ms);
+    align_range_boundary_tz(ts_ms, unit, UTC)
+}
+
+pub fn align_range_boundary_tz(ts_ms: i64, unit: TimeUnit, tz: Tz) -> i64 {
+    let dt = in_tz(ts_ms, tz);
     let dt = match unit {
         TimeUnit::Years => start_of_day(dt.with_month(1).unwrap().with_day(1).unwrap()),
         TimeUnit::Months => start_of_day(dt.with_day(1).unwrap()),
@@ -133,7 +164,7 @@ pub fn align_range_boundary(ts_ms: i64, unit: TimeUnit) -> i64 {
     dt.timestamp_millis()
 }
 
-fn start_of_day(dt: DateTime<Utc>) -> DateTime<Utc> {
+fn start_of_day(dt: DateTime<Tz>) -> DateTime<Tz> {
     dt.with_hour(0)
         .unwrap()
         .with_minute(0)
@@ -149,28 +180,39 @@ fn start_of_day(dt: DateTime<Utc>) -> DateTime<Utc> {
 pub struct RangeCalc {
     pub start_time_ms: i64,
     pub sampling: Sampling,
+    pub tz: Tz,
 }
 
 impl RangeCalc {
     /// `start_time_ms` is the query start; pass it through
-    /// [`align_range_boundary`] first when `align_sampling` is set.
+    /// [`align_range_boundary_tz`] first when `align_sampling` is set.
     pub fn new(start_time_ms: i64, sampling: Sampling) -> Self {
-        RangeCalc { start_time_ms, sampling }
+        Self::new_tz(start_time_ms, sampling, UTC)
+    }
+
+    pub fn new_tz(start_time_ms: i64, sampling: Sampling, tz: Tz) -> Self {
+        RangeCalc { start_time_ms, sampling, tz }
     }
 
     pub fn start_range(&self, ts_ms: i64) -> i64 {
-        let periods = unit_difference(ts_ms, self.start_time_ms, self.sampling.unit)
+        let periods = unit_difference_tz(ts_ms, self.start_time_ms, self.sampling.unit, self.tz)
             / self.sampling.value;
-        add_units(self.start_time_ms, self.sampling.unit, periods * self.sampling.value)
+        add_units_tz(
+            self.start_time_ms,
+            self.sampling.unit,
+            periods * self.sampling.value,
+            self.tz,
+        )
     }
 
     pub fn end_range(&self, ts_ms: i64) -> i64 {
-        let periods = unit_difference(ts_ms, self.start_time_ms, self.sampling.unit)
+        let periods = unit_difference_tz(ts_ms, self.start_time_ms, self.sampling.unit, self.tz)
             / self.sampling.value;
-        add_units(
+        add_units_tz(
             self.start_time_ms,
             self.sampling.unit,
             (periods + 1) * self.sampling.value,
+            self.tz,
         )
     }
 }

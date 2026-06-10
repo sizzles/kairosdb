@@ -399,6 +399,14 @@ impl CassandraDatastore {
             .into_rows_result()
             .map_err(|e| store_err("data_points rows", e))?;
 
+        // Legacy rows always use the bit-shifted column format, whatever the
+        // cluster's spec says, and carry the ValueSerializer value encoding.
+        let legacy = row_key.data_type == DST_LEGACY;
+        let spec = if legacy {
+            RowSpec { legacy: true, ..self.spec }
+        } else {
+            self.spec
+        };
         let mut points = Vec::new();
         for row in result
             .rows::<(Vec<u8>, Vec<u8>)>()
@@ -408,12 +416,14 @@ impl CassandraDatastore {
             let column: [u8; 4] = column
                 .try_into()
                 .map_err(|_| Error::Datastore("data_points column1 is not 4 bytes".into()))?;
-            let timestamp_ms = self
-                .spec
-                .column_timestamp(row_key.row_time_ms, i32::from_be_bytes(column));
+            let column = i32::from_be_bytes(column);
             points.push(DataPoint {
-                timestamp_ms,
-                value: Value::read_from(&row_key.data_type, &value)?,
+                timestamp_ms: spec.column_timestamp(row_key.row_time_ms, column),
+                value: if legacy {
+                    crate::cassandra::decode_legacy_value(column, &value)?
+                } else {
+                    Value::read_from(&row_key.data_type, &value)?
+                },
             });
         }
         Ok(points)
@@ -522,13 +532,7 @@ impl Datastore for CassandraDatastore {
     }
 
     async fn query(&self, query: &DatastoreQuery) -> Result<Vec<SeriesData>> {
-        // Legacy (pre-1.1) value encoding is not supported yet.
-        let row_keys: Vec<DataPointsRowKey> = self
-            .matching_row_keys(query)
-            .await?
-            .into_iter()
-            .filter(|rk| rk.data_type != DST_LEGACY)
-            .collect();
+        let row_keys = self.matching_row_keys(query).await?;
 
         // Fan the per-row reads out concurrently, like the Java
         // semaphore-bounded async query path.

@@ -8,11 +8,15 @@
 //! - `KAIROSD_DATA_DIR`: WAL + rollup task storage (default `./kairosd-data`,
 //!   `none` disables the WAL and rollup persistence)
 //! - `KAIROSD_LISTEN`: bind address (default `0.0.0.0:8080`)
+//! - `KAIROSD_TELNET_LISTEN`: telnet bind address (default `0.0.0.0:4242`,
+//!   `none` disables)
 
 mod api;
+mod features;
 mod ingest;
 mod rollup;
 mod store;
+mod telnet;
 
 use std::sync::Arc;
 
@@ -65,6 +69,16 @@ async fn main() {
         .await
         .unwrap_or_else(|e| panic!("ingest start (wal replay) failed: {e}"));
     let rollups = RollupManager::start(store.clone(), ingest.clone(), rollup_file);
+
+    let telnet_addr =
+        std::env::var("KAIROSD_TELNET_LISTEN").unwrap_or_else(|_| "0.0.0.0:4242".to_string());
+    if telnet_addr != "none" {
+        let telnet_listener = tokio::net::TcpListener::bind(&telnet_addr)
+            .await
+            .unwrap_or_else(|e| panic!("cannot bind telnet {telnet_addr}: {e}"));
+        tracing::info!("telnet listening on {telnet_addr}");
+        tokio::spawn(telnet::serve(telnet_listener, ingest.clone()));
+    }
 
     let app = api::router(AppState { store, ingest, rollups });
 

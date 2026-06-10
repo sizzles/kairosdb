@@ -34,6 +34,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/metric/{name}", delete(delete_metric))
         .route("/api/v1/health/check", get(health_check))
         .route("/api/v1/health/status", get(health_status))
+        .route("/api/v1/features", get(list_features))
+        .route("/api/v1/features/{feature}", get(get_feature))
         .route("/api/v1/rollups", post(create_rollup).get(list_rollups))
         .route(
             "/api/v1/rollups/{id}",
@@ -193,6 +195,7 @@ pub(crate) async fn run_metric_query(
     metric: &MetricQuery,
     start_ms: i64,
     end_ms: i64,
+    tz: chrono_tz::Tz,
 ) -> Result<(usize, Vec<GroupResult>, Vec<DataPointSet>), String> {
     let series = store
         .query(&DatastoreQuery {
@@ -212,7 +215,7 @@ pub(crate) async fn run_metric_query(
         .map(|s| SeriesInput { tags: s.tags, points: s.points })
         .collect();
 
-    let (groups, saved) = kairos_query::model::execute(metric, inputs, start_ms, end_ms)
+    let (groups, saved) = kairos_query::model::execute(metric, inputs, start_ms, end_ms, tz)
         .map_err(|e| e.to_string())?;
     Ok((sample_size, groups, saved))
 }
@@ -225,11 +228,14 @@ async fn query_datapoints(
     let (start_ms, end_ms) = request
         .resolve_time_range(now_ms)
         .map_err(|e| bad_request(e.to_string()))?;
+    let tz = request
+        .parse_time_zone()
+        .map_err(|e| bad_request(e.to_string()))?;
 
     let mut queries = Vec::new();
     for metric in &request.metrics {
         let (sample_size, groups, saved) =
-            run_metric_query(&state.store, metric, start_ms, end_ms)
+            run_metric_query(&state.store, metric, start_ms, end_ms, tz)
                 .await
                 .map_err(bad_request)?;
         for set in saved {
@@ -363,6 +369,23 @@ async fn health_status(State(state): State<AppState>) -> Json<JsonValue> {
         Err(_) => "Datastore-Query: FAIL",
     };
     Json(json!([datastore, "Ingest-Queue: OK"]))
+}
+
+async fn list_features() -> Json<JsonValue> {
+    Json(crate::features::features())
+}
+
+async fn get_feature(Path(feature): Path<String>) -> Result<Json<JsonValue>, ApiError> {
+    crate::features::features()
+        .as_array()
+        .and_then(|features| {
+            features
+                .iter()
+                .find(|f| f["name"] == feature.as_str())
+                .cloned()
+        })
+        .map(Json)
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("unknown feature: {feature}")))
 }
 
 impl From<RollupError> for ApiError {

@@ -193,7 +193,7 @@ pub struct Rate {
 }
 
 impl SeriesAggregator for Rate {
-    fn aggregate(&self, _ctx: &QueryContext, points: Vec<DataPoint>) -> Vec<DataPoint> {
+    fn aggregate(&self, ctx: &QueryContext, points: Vec<DataPoint>) -> Vec<DataPoint> {
         points
             .windows(2)
             .filter_map(|w| {
@@ -203,8 +203,8 @@ impl SeriesAggregator for Rate {
                     // Java throws here; we drop the pair instead.
                     return None;
                 }
-                let duration =
-                    kairos_core::time::add_units(y0, self.sampling.unit, self.sampling.value) - y0;
+                let duration = kairos_core::time::add_units_tz(
+                    y0, self.sampling.unit, self.sampling.value, ctx.tz) - y0;
                 let rate = (x1 - x0) / (y1 - y0) as f64 * duration as f64;
                 Some(DataPoint::new(y1, rate))
             })
@@ -409,7 +409,7 @@ pub struct Sampler {
 }
 
 impl SeriesAggregator for Sampler {
-    fn aggregate(&self, _ctx: &QueryContext, points: Vec<DataPoint>) -> Vec<DataPoint> {
+    fn aggregate(&self, ctx: &QueryContext, points: Vec<DataPoint>) -> Vec<DataPoint> {
         points
             .windows(2)
             .filter_map(|w| {
@@ -419,8 +419,8 @@ impl SeriesAggregator for Sampler {
                     // Java throws here; we drop the pair instead.
                     return None;
                 }
-                let duration =
-                    kairos_core::time::add_units(y0, self.sampling.unit, self.sampling.value) - y0;
+                let duration = kairos_core::time::add_units_tz(
+                    y0, self.sampling.unit, self.sampling.value, ctx.tz) - y0;
                 Some(DataPoint::new(y1, x1 / (y1 - y0) as f64 * duration as f64))
             })
             .collect()

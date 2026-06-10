@@ -58,6 +58,15 @@ for name, aggs in cases:
     check(name, values(sj[1]) == values(rj[1]),
           f"\n   java={values(sj[1])!r:.200}\n   rust={values(rj[1])!r:.200}")
 
+print("== time_zone (calendar buckets in America/New_York) ==")
+tzq = dict(W, time_zone="America/New_York",
+           metrics=[{"name":"regress.series",
+                     "aggregators":[{"name":"avg","sampling":{"value":1,"unit":"months"},
+                                     "align_sampling":True,"align_start_time":True}]}])
+sj, rj = post(JAVA, "/datapoints/query", tzq), post(RUST, "/datapoints/query", tzq)
+check("time_zone", values(sj[1]) == values(rj[1]),
+      f"\n   java={values(sj[1])}\n   rust={values(rj[1])}")
+
 print("== desc order + limit ==")
 sj = post(JAVA, "/datapoints/query", q(extra={"order":"desc","limit":5}))
 rj = post(RUST, "/datapoints/query", q(extra={"order":"desc","limit":5}))

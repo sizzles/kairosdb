@@ -16,8 +16,22 @@ pub struct QueryRequest {
     pub end_absolute: Option<i64>,
     pub start_relative: Option<RelativeTime>,
     pub end_relative: Option<RelativeTime>,
+    /// Query-level IANA time zone, e.g. "America/New_York" (Java
+    /// `TimezoneAware`); applies to calendar-unit sampling and group-bys.
+    pub time_zone: Option<String>,
     #[serde(default)]
     pub metrics: Vec<MetricQuery>,
+}
+
+impl QueryRequest {
+    pub fn parse_time_zone(&self) -> Result<chrono_tz::Tz> {
+        match &self.time_zone {
+            None => Ok(kairos_core::time::UTC),
+            Some(name) => name
+                .parse()
+                .map_err(|_| Error::InvalidQuery(format!("unknown time_zone: {name}"))),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -191,6 +205,7 @@ enum PointGrouper {
         range_unit: TimeUnit,
         group_count: i64,
         start_ms: i64,
+        tz: chrono_tz::Tz,
     },
     /// `ValueGroupBy`: value truncated to an integer, divided by range size.
     Value { range_size: i64 },
@@ -199,7 +214,11 @@ enum PointGrouper {
 }
 
 impl PointGrouper {
-    fn from_spec(spec: &GroupBySpec, query_start_ms: i64) -> Result<Option<PointGrouper>> {
+    fn from_spec(
+        spec: &GroupBySpec,
+        query_start_ms: i64,
+        tz: chrono_tz::Tz,
+    ) -> Result<Option<PointGrouper>> {
         match spec.name.as_str() {
             "tag" => Ok(None), // handled at the series level
             "time" => {
@@ -215,6 +234,7 @@ impl PointGrouper {
                         Error::InvalidQuery("time group_by requires group_count".into())
                     })?,
                     start_ms: query_start_ms,
+                    tz,
                 }))
             }
             "value" => {
@@ -244,12 +264,14 @@ impl PointGrouper {
                 range_unit,
                 group_count,
                 start_ms,
+                tz,
             } => {
                 if *range_unit == TimeUnit::Months {
-                    let months = kairos_core::time::unit_difference(
+                    let months = kairos_core::time::unit_difference_tz(
                         point.timestamp_ms,
                         *start_ms,
                         TimeUnit::Months,
+                        *tz,
                     );
                     (months % group_count) as i32
                 } else {
@@ -353,6 +375,7 @@ pub fn execute(
     series: Vec<SeriesInput>,
     query_start_ms: i64,
     query_end_ms: i64,
+    tz: chrono_tz::Tz,
 ) -> Result<(Vec<GroupResult>, Vec<kairos_core::DataPointSet>)> {
     let group_tags: Vec<&String> = metric
         .group_by
@@ -363,7 +386,7 @@ pub fn execute(
     let groupers: Vec<PointGrouper> = metric
         .group_by
         .iter()
-        .filter_map(|g| PointGrouper::from_spec(g, query_start_ms).transpose())
+        .filter_map(|g| PointGrouper::from_spec(g, query_start_ms, tz).transpose())
         .collect::<Result<_>>()?;
 
     let mut groups: BTreeMap<Vec<String>, Vec<SeriesInput>> = BTreeMap::new();
@@ -413,6 +436,7 @@ pub fn execute(
             let ctx = crate::QueryContext {
                 start_ms: query_start_ms,
                 end_ms: query_end_ms,
+                tz,
                 source_metric: metric.name.clone(),
                 group_tags: group.clone(),
                 save_sink: std::sync::Mutex::new(Vec::new()),
@@ -510,6 +534,7 @@ mod tests {
             ],
             0,
             i64::MAX,
+            kairos_core::time::UTC,
         )
         .unwrap();
         assert_eq!(results.len(), 1);
@@ -531,6 +556,7 @@ mod tests {
             vec![series(&[], &[(0, 1.0), (100, 2.0), (DAY + 5, 3.0)])],
             0,
             i64::MAX,
+            kairos_core::time::UTC,
         )
         .unwrap();
         assert_eq!(results.len(), 2);
@@ -550,6 +576,7 @@ mod tests {
             vec![series(&[], &[(1, 3.0), (2, 25.0), (3, 7.0)])],
             0,
             i64::MAX,
+            kairos_core::time::UTC,
         )
         .unwrap();
         assert_eq!(results.len(), 2);
@@ -568,6 +595,7 @@ mod tests {
             vec![series(&[], &[(1, 5.0), (2, 15.0), (3, 25.0)])],
             0,
             i64::MAX,
+            kairos_core::time::UTC,
         )
         .unwrap();
         assert_eq!(results.len(), 3);
@@ -590,6 +618,7 @@ mod tests {
             ],
             0,
             i64::MAX,
+            kairos_core::time::UTC,
         )
         .unwrap();
         assert_eq!(results.len(), 2);

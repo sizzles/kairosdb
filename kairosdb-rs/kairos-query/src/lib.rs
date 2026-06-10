@@ -12,7 +12,8 @@ pub mod model;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-use kairos_core::time::{align_range_boundary, RangeCalc};
+use chrono_tz::Tz;
+use kairos_core::time::{align_range_boundary_tz, RangeCalc};
 use kairos_core::{DataPoint, DataPointSet, Sampling};
 
 #[derive(Debug, thiserror::Error)]
@@ -33,6 +34,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub struct QueryContext {
     pub start_ms: i64,
     pub end_ms: i64,
+    /// Query-level `time_zone` (Java `TimezoneAware`), default UTC.
+    pub tz: Tz,
     pub source_metric: String,
     /// Tag values of the current tag group-by partition.
     pub group_tags: BTreeMap<String, String>,
@@ -82,11 +85,11 @@ impl Aggregator {
                 sub,
             } => {
                 let anchor = if *align_sampling {
-                    align_range_boundary(ctx.start_ms, sampling.unit)
+                    align_range_boundary_tz(ctx.start_ms, sampling.unit, ctx.tz)
                 } else {
                     ctx.start_ms
                 };
-                let calc = RangeCalc::new(anchor, *sampling);
+                let calc = RangeCalc::new_tz(anchor, *sampling, ctx.tz);
                 if *exhaustive {
                     return run_exhaustive(&calc, ctx, sub.as_ref(), *align_start_time, points);
                 }
@@ -192,6 +195,7 @@ pub(crate) fn test_context(start_ms: i64, end_ms: i64) -> QueryContext {
     QueryContext {
         start_ms,
         end_ms,
+        tz: kairos_core::time::UTC,
         source_metric: "test.metric".to_string(),
         group_tags: BTreeMap::new(),
         save_sink: Mutex::new(Vec::new()),

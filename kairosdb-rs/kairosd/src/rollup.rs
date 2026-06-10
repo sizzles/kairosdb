@@ -184,11 +184,13 @@ impl RollupManager {
             let (start_ms, end_ms) = request
                 .resolve_time_range(now_ms)
                 .map_err(|e| e.to_string())?;
+            let tz = request.parse_time_zone().map_err(|e| e.to_string())?;
 
             for metric in &request.metrics {
-                let (_, groups, saved) = run_metric_query(&self.store, metric, start_ms, end_ms)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                let (_, groups, saved) =
+                    run_metric_query(&self.store, metric, start_ms, end_ms, tz)
+                        .await
+                        .map_err(|e| e.to_string())?;
                 for set in saved {
                     self.ingest.submit(set).await.map_err(|e| e.to_string())?;
                 }

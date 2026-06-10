@@ -12,7 +12,7 @@ with commodity-market-data extensions to follow.
 | `kairos-core` | Data model (`Value`, `DataPoint`, `DataPointSet`), the zig-zag varint value codec (byte-compatible with `org.kairosdb.util.Util`), time units and the `RangeAggregator` bucketing math |
 | `kairos-store` | `Datastore` trait, in-memory backend, the **WAL** (segmented, CRC-checked, checkpointed), and the **Cassandra backend** (`scylla` driver, concurrent reads, batched writes) using the Java schema: `data_points`, `row_keys`, `row_key_time_index`, `string_index`, `spec` |
 | `kairos-query` | Range-aggregation engine; all 23 Java aggregators (`sum`, `avg`, `min`, `max`, `count`, `dev`, `percentile`, `first`, `last`, `scale`, `div`, `diff`, `rate`, `sma`, `filter`, `trim`, `pad`, `gaps`, `least_squares`, `sampler`, `score`, `time_diff`, `save_as`); group-bys `tag`, `time`, `value`, `bin`; `order: desc`; wire-compatible query JSON model |
-| `kairosd` | Server binary: `/api/v1` REST endpoints (`datapoints` incl. gzip, `datapoints/query`, `datapoints/query/tags`, `datapoints/delete`, `metric/{name}` delete, `metricnames?prefix=`, `health/check`, `health/status`, `rollups`, `version`) on axum; durable ingest pipeline (WAL → queue → batched writes, replay on restart); rollup scheduler |
+| `kairosd` | Server binary: `/api/v1` REST endpoints (`datapoints` incl. gzip, `datapoints/query`, `datapoints/query/tags`, `datapoints/delete`, `metric/{name}` delete, `metricnames?prefix=`, `health/check`, `health/status`, `features`, `rollups`, `version`) on axum; Telnet ingest (`put`/`putm`/`puts`/`version`, port 4242); durable ingest pipeline (WAL → queue → batched writes, replay on restart); rollup scheduler |
 
 ## Verified storage-level interop with Java KairosDB
 
@@ -84,11 +84,12 @@ curl -X POST localhost:8080/api/v1/datapoints/query -d '{
 
 ## Not here yet (see the proposal)
 
-Telnet ingest, per-query time zones (calendar math is UTC-only), the
-`/api/v1/features` and metadata/service APIs, distributed rollup assignment
-(rollups are single-node), legacy (pre-1.1) value decoding, and the
-`kairos-commodity` crate (reference data, OHLCV values, curve queries,
-continuous contracts). Known divergences: `percentile` is exact instead of
-reservoir-sampled past 1028 points; `rate`/`sampler` drop equal-timestamp
-pairs instead of erroring; descending queries aggregate ascending and
-reverse the output.
+The `/api/v1/metadata` service-values API, distributed rollup assignment
+(rollups run on a single designated node; for multi-node deployments run
+rollups on one instance), admin/internal endpoints (`killquery`,
+`runningqueries`, `backfill`), and the `kairos-commodity` crate (reference
+data, OHLCV values, curve queries, continuous contracts). Known divergences:
+`percentile` is exact instead of reservoir-sampled past 1028 points;
+`rate`/`sampler` drop equal-timestamp pairs instead of erroring; descending
+queries aggregate ascending and reverse the output; `/features` property
+metadata covers common fields rather than every validation annotation.
