@@ -33,11 +33,16 @@ pub enum Value {
     /// renders as JSON `null` and is never stored.
     Null,
     /// Plugin-defined type: raw stored bytes plus the datastore type that
-    /// knows how to decode them.
-    Custom {
-        data_type: Arc<str>,
-        bytes: Arc<[u8]>,
-    },
+    /// knows how to decode them. Boxed to keep `Value` (and every
+    /// `DataPoint`) small — this variant is rare, the size tax would be
+    /// universal.
+    Custom(Box<CustomValue>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CustomValue {
+    pub data_type: Arc<str>,
+    pub bytes: Arc<[u8]>,
 }
 
 impl Value {
@@ -47,7 +52,7 @@ impl Value {
             Value::Double(_) => DST_DOUBLE,
             Value::Text(_) => DST_STRING,
             Value::Null => DST_NULL,
-            Value::Custom { data_type, .. } => data_type,
+            Value::Custom(c) => &c.data_type,
         }
     }
 
@@ -56,7 +61,7 @@ impl Value {
             Value::Long(_) | Value::Double(_) => GROUP_NUMBER,
             Value::Text(_) => GROUP_TEXT,
             Value::Null => GROUP_NUMBER,
-            Value::Custom { .. } => GROUP_TEXT,
+            Value::Custom(_) => GROUP_TEXT,
         }
     }
 
@@ -87,7 +92,7 @@ impl Value {
                 out.extend_from_slice(bytes);
             }
             Value::Null => {}
-            Value::Custom { bytes, .. } => out.extend_from_slice(bytes),
+            Value::Custom(c) => out.extend_from_slice(&c.bytes),
         }
     }
 
@@ -117,10 +122,10 @@ impl Value {
                 let text = buf.get(2..2 + len).ok_or(Error::Underflow)?;
                 Ok(Value::Text(std::str::from_utf8(text)?.into()))
             }
-            other => Ok(Value::Custom {
+            other => Ok(Value::Custom(Box::new(CustomValue {
                 data_type: other.into(),
                 bytes: buf.into(),
-            }),
+            }))),
         }
     }
 }
@@ -146,6 +151,14 @@ impl From<&str> for Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn value_stays_small() {
+        // The whole pipeline's memory traffic scales with this; the boxed
+        // Custom variant keeps Text (16-byte Arc<str>) as the ceiling.
+        assert!(std::mem::size_of::<Value>() <= 24, "{}", std::mem::size_of::<Value>());
+        assert!(std::mem::size_of::<crate::DataPoint>() <= 32);
+    }
 
     #[test]
     fn long_roundtrip() {

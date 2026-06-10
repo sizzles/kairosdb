@@ -376,6 +376,7 @@ pub fn execute(
     query_start_ms: i64,
     query_end_ms: i64,
     tz: chrono_tz::Tz,
+    fast: bool,
 ) -> Result<(Vec<GroupResult>, Vec<kairos_core::DataPointSet>)> {
     let group_tags: Vec<&String> = metric
         .group_by
@@ -442,7 +443,7 @@ pub fn execute(
                 save_sink: std::sync::Mutex::new(Vec::new()),
             };
             for spec in &metric.aggregators {
-                let aggregator = aggregators::build(spec)?;
+                let aggregator = aggregators::build(spec, fast)?;
                 points = aggregator.run(&ctx, points);
             }
             saved.extend(ctx.save_sink.into_inner().expect("save sink poisoned"));
@@ -535,6 +536,7 @@ mod tests {
             0,
             i64::MAX,
             kairos_core::time::UTC,
+            false,
         )
         .unwrap();
         assert_eq!(results.len(), 1);
@@ -557,6 +559,7 @@ mod tests {
             0,
             i64::MAX,
             kairos_core::time::UTC,
+            false,
         )
         .unwrap();
         assert_eq!(results.len(), 2);
@@ -577,6 +580,7 @@ mod tests {
             0,
             i64::MAX,
             kairos_core::time::UTC,
+            false,
         )
         .unwrap();
         assert_eq!(results.len(), 2);
@@ -596,6 +600,7 @@ mod tests {
             0,
             i64::MAX,
             kairos_core::time::UTC,
+            false,
         )
         .unwrap();
         assert_eq!(results.len(), 3);
@@ -619,6 +624,7 @@ mod tests {
             0,
             i64::MAX,
             kairos_core::time::UTC,
+            false,
         )
         .unwrap();
         assert_eq!(results.len(), 2);

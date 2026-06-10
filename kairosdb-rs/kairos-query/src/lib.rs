@@ -7,6 +7,7 @@
 //! point's time in the bucket unless alignment is requested.
 
 pub mod aggregators;
+pub mod columnar;
 pub mod model;
 
 use std::collections::BTreeMap;
@@ -48,6 +49,24 @@ pub struct QueryContext {
 /// called for empty ranges.
 pub trait RangeSubAggregator: Send + Sync {
     fn aggregate(&self, return_time: i64, points: &[DataPoint]) -> Vec<DataPoint>;
+
+    /// Columnar fast path over the pre-extracted value column (same index
+    /// space as `points`). Kernels that benefit override this (and
+    /// `wants_columnar`); the default falls back to the row form.
+    fn aggregate_columnar(
+        &self,
+        return_time: i64,
+        _values: &[f64],
+        points: &[DataPoint],
+    ) -> Vec<DataPoint> {
+        self.aggregate(return_time, points)
+    }
+
+    /// Whether column extraction pays off for this kernel; aggregators that
+    /// only pass points through (first/last/pad/...) skip the extra pass.
+    fn wants_columnar(&self) -> bool {
+        false
+    }
 }
 
 /// Transforms a whole series — the analogue of non-range aggregators such as
@@ -93,60 +112,46 @@ impl Aggregator {
                 if *exhaustive {
                     return run_exhaustive(&calc, ctx, sub.as_ref(), *align_start_time, points);
                 }
+                // Buckets are index ranges over the sorted series; extracting
+                // columns once removes the per-point enum branch from every
+                // kernel's inner loop (and enables the vector kernels).
+                let cols = if sub.wants_columnar() {
+                    columnar::extract_values(&points)
+                } else {
+                    None
+                };
                 let mut out = Vec::new();
-                let mut bucket: Vec<DataPoint> = Vec::new();
-                let mut bucket_end = i64::MIN;
-                for point in points {
-                    if point.timestamp_ms >= bucket_end {
-                        flush_bucket(
-                            sub.as_ref(),
-                            &calc,
-                            &mut bucket,
-                            *align_start_time,
-                            *align_end_time,
-                            &mut out,
-                        );
-                        bucket_end = calc.end_range(point.timestamp_ms);
+                let mut start = 0;
+                while start < points.len() {
+                    let end_range = calc.end_range(points[start].timestamp_ms);
+                    let mut end = start + 1;
+                    while end < points.len() && points[end].timestamp_ms < end_range {
+                        end += 1;
                     }
-                    bucket.push(point);
+                    // Java getDataPointTime(): first point's timestamp, or
+                    // the range start/end when alignment is requested.
+                    let first_ts = points[start].timestamp_ms;
+                    let return_time = if *align_start_time {
+                        calc.start_range(first_ts)
+                    } else if *align_end_time {
+                        calc.end_range(first_ts)
+                    } else {
+                        first_ts
+                    };
+                    match &cols {
+                        Some(values) => out.extend(sub.aggregate_columnar(
+                            return_time,
+                            &values[start..end],
+                            &points[start..end],
+                        )),
+                        None => out.extend(sub.aggregate(return_time, &points[start..end])),
+                    }
+                    start = end;
                 }
-                flush_bucket(
-                    sub.as_ref(),
-                    &calc,
-                    &mut bucket,
-                    *align_start_time,
-                    *align_end_time,
-                    &mut out,
-                );
                 out
             }
         }
     }
-}
-
-fn flush_bucket(
-    sub: &dyn RangeSubAggregator,
-    calc: &RangeCalc,
-    bucket: &mut Vec<DataPoint>,
-    align_start: bool,
-    align_end: bool,
-    out: &mut Vec<DataPoint>,
-) {
-    if bucket.is_empty() {
-        return;
-    }
-    // Java getDataPointTime(): first point's timestamp, or the range
-    // start/end when alignment is requested.
-    let first_ts = bucket[0].timestamp_ms;
-    let return_time = if align_start {
-        calc.start_range(first_ts)
-    } else if align_end {
-        calc.end_range(first_ts)
-    } else {
-        first_ts
-    };
-    out.extend(sub.aggregate(return_time, bucket));
-    bucket.clear();
 }
 
 /// Java `ExhaustiveRangeDataPointAggregator`: walk every range from the
@@ -219,7 +224,7 @@ mod tests {
             align_start_time: false,
             align_end_time: false,
             exhaustive: false,
-            sub: Box::new(SumSub),
+            sub: Box::new(SumSub { fast: false }),
         }
     }
 
@@ -253,7 +258,7 @@ mod tests {
             align_start_time: true,
             align_end_time: false,
             exhaustive: false,
-            sub: Box::new(SumSub),
+            sub: Box::new(SumSub { fast: false }),
         };
         let ctx = test_context(0, 100);
         let result = agg.run(&ctx, pts(&[(7, 1.0), (13, 2.0)]));

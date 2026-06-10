@@ -43,6 +43,34 @@ share a Cassandra keyspace.
 Rough single-run numbers from this repo's dev container, not a tuned
 benchmark; the end-to-end drain is bottlenecked by the shared Cassandra node.
 
+## Vectorized aggregation kernels
+
+`kairos-query/src/columnar.rs` provides lane-parallel (auto-vectorizing)
+kernels; `cargo run --release -p kairos-query --example agg_bench` measures
+them. Pure-kernel throughput over 8M contiguous f64 in this container
+(SSE2 baseline — build with `-C target-cpu=native` for AVX2+):
+
+| kernel | strict (Java-identical) | fast (lane-parallel) |
+|---|---|---|
+| sum | ~700 M vals/s | ~1.2–1.3 G vals/s |
+| dev | ~150 M vals/s | ~530–660 M vals/s |
+| min/max | — | ~0.9–1.1 G vals/s (exact, always on) |
+
+`KAIROSD_QUERY_MODE=fast` switches `sum`/`avg`/`dev` to the fast kernels;
+results differ from Java only by float reassociation (observed < 1e-9
+relative; the two-pass `dev` is numerically *better* than the recurrence).
+The default `compat` mode stays bit-identical to the Java server — the
+regression suite runs against it.
+
+Profiling finding (`examples/profile_stages.rs`): with row-form
+`Vec<DataPoint>` input the pipeline is bound by point-struct memory traffic,
+not kernel math — boxing the rare `Custom` value variant shrank `DataPoint`
+48→32 bytes for a ~30% end-to-end win, while converting rows to columns
+mid-query costs more than cheap kernels save. The kernels therefore run
+where they pay (`dev`-fast, `percentile`) and stand ready for the planned
+columnar-at-rest (Arrow/Parquet) tier, where data arrives contiguous and the
+G-vals/s rates apply directly.
+
 ## Running
 
 ```sh

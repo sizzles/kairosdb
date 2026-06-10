@@ -26,6 +26,7 @@ pub struct RollupManager {
     store: Arc<AnyDatastore>,
     ingest: Ingest,
     file: Option<PathBuf>,
+    fast_math: bool,
     tasks: Mutex<HashMap<String, TaskEntry>>,
 }
 
@@ -61,11 +62,13 @@ impl RollupManager {
         store: Arc<AnyDatastore>,
         ingest: Ingest,
         file: Option<PathBuf>,
+        fast_math: bool,
     ) -> Arc<RollupManager> {
         let manager = Arc::new(RollupManager {
             store,
             ingest,
             file,
+            fast_math,
             tasks: Mutex::new(HashMap::new()),
         });
 
@@ -188,7 +191,7 @@ impl RollupManager {
 
             for metric in &request.metrics {
                 let (_, groups, saved) =
-                    run_metric_query(&self.store, metric, start_ms, end_ms, tz)
+                    run_metric_query(&self.store, metric, start_ms, end_ms, tz, self.fast_math)
                         .await
                         .map_err(|e| e.to_string())?;
                 for set in saved {

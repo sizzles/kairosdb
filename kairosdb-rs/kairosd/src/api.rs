@@ -21,6 +21,10 @@ pub struct AppState {
     pub store: Arc<AnyDatastore>,
     pub ingest: Ingest,
     pub rollups: Arc<RollupManager>,
+    /// `KAIROSD_QUERY_MODE=fast` enables vectorized sum/avg/dev kernels
+    /// (last-ulp float divergence from Java); `compat` (default) stays
+    /// bit-identical.
+    pub fast_math: bool,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -196,6 +200,7 @@ pub(crate) async fn run_metric_query(
     start_ms: i64,
     end_ms: i64,
     tz: chrono_tz::Tz,
+    fast: bool,
 ) -> Result<(usize, Vec<GroupResult>, Vec<DataPointSet>), String> {
     let series = store
         .query(&DatastoreQuery {
@@ -215,7 +220,7 @@ pub(crate) async fn run_metric_query(
         .map(|s| SeriesInput { tags: s.tags, points: s.points })
         .collect();
 
-    let (groups, saved) = kairos_query::model::execute(metric, inputs, start_ms, end_ms, tz)
+    let (groups, saved) = kairos_query::model::execute(metric, inputs, start_ms, end_ms, tz, fast)
         .map_err(|e| e.to_string())?;
     Ok((sample_size, groups, saved))
 }
@@ -235,7 +240,7 @@ async fn query_datapoints(
     let mut queries = Vec::new();
     for metric in &request.metrics {
         let (sample_size, groups, saved) =
-            run_metric_query(&state.store, metric, start_ms, end_ms, tz)
+            run_metric_query(&state.store, metric, start_ms, end_ms, tz, state.fast_math)
                 .await
                 .map_err(bad_request)?;
         for set in saved {
@@ -441,7 +446,7 @@ fn value_pair(point: &DataPoint) -> JsonValue {
         Value::Long(v) => json!(v),
         Value::Double(v) => json!(v),
         Value::Text(s) => json!(s.as_ref()),
-        Value::Null | Value::Custom { .. } => JsonValue::Null,
+        Value::Null | Value::Custom(_) => JsonValue::Null,
     };
     json!([point.timestamp_ms, value])
 }
@@ -458,8 +463,8 @@ mod tests {
     async fn memory_router() -> Router {
         let store = Arc::new(AnyDatastore::Memory(MemoryDatastore::new()));
         let ingest = Ingest::start(None, store.clone()).await.unwrap();
-        let rollups = RollupManager::start(store.clone(), ingest.clone(), None);
-        router(AppState { store, ingest, rollups })
+        let rollups = RollupManager::start(store.clone(), ingest.clone(), None, false);
+        router(AppState { store, ingest, rollups, fast_math: false })
     }
 
     /// Ingest is asynchronous; tests must let the consumer drain.

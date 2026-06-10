@@ -10,6 +10,8 @@
 //! - `KAIROSD_LISTEN`: bind address (default `0.0.0.0:8080`)
 //! - `KAIROSD_TELNET_LISTEN`: telnet bind address (default `0.0.0.0:4242`,
 //!   `none` disables)
+//! - `KAIROSD_QUERY_MODE`: `compat` (default, bit-identical to Java) or
+//!   `fast` (vectorized sum/avg/dev kernels)
 
 mod api;
 mod features;
@@ -65,10 +67,19 @@ async fn main() {
         (Some(Arc::new(wal)), Some(dir.join("rollups.json")))
     };
 
+    let fast_math = match std::env::var("KAIROSD_QUERY_MODE").as_deref() {
+        Ok("fast") => true,
+        Ok("compat") | Err(_) => false,
+        Ok(other) => panic!("unknown KAIROSD_QUERY_MODE: {other}"),
+    };
+    if fast_math {
+        tracing::info!("query mode: fast (vectorized sum/avg/dev; last-ulp divergence from Java)");
+    }
+
     let ingest = Ingest::start(wal, store.clone())
         .await
         .unwrap_or_else(|e| panic!("ingest start (wal replay) failed: {e}"));
-    let rollups = RollupManager::start(store.clone(), ingest.clone(), rollup_file);
+    let rollups = RollupManager::start(store.clone(), ingest.clone(), rollup_file, fast_math);
 
     let telnet_addr =
         std::env::var("KAIROSD_TELNET_LISTEN").unwrap_or_else(|_| "0.0.0.0:4242".to_string());
@@ -80,7 +91,7 @@ async fn main() {
         tokio::spawn(telnet::serve(telnet_listener, ingest.clone()));
     }
 
-    let app = api::router(AppState { store, ingest, rollups });
+    let app = api::router(AppState { store, ingest, rollups, fast_math });
 
     let addr = std::env::var("KAIROSD_LISTEN").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     let listener = tokio::net::TcpListener::bind(&addr)

@@ -6,16 +6,29 @@ use kairos_core::{DataPoint, DataPointSet, Value};
 use crate::{Aggregator, Error, QueryContext, RangeSubAggregator, Result, SeriesAggregator};
 use crate::model::AggregatorSpec;
 
-pub struct SumSub;
+pub struct SumSub {
+    pub fast: bool,
+}
 
 impl RangeSubAggregator for SumSub {
     fn aggregate(&self, return_time: i64, points: &[DataPoint]) -> Vec<DataPoint> {
         let sum: f64 = points.iter().filter_map(|p| p.value.as_f64()).sum();
         vec![DataPoint::new(return_time, sum)]
     }
+
+    fn aggregate_columnar(
+        &self,
+        return_time: i64,
+        values: &[f64],
+        _points: &[DataPoint],
+    ) -> Vec<DataPoint> {
+        vec![DataPoint::new(return_time, crate::columnar::sum(values, self.fast))]
+    }
 }
 
-pub struct AvgSub;
+pub struct AvgSub {
+    pub fast: bool,
+}
 
 impl RangeSubAggregator for AvgSub {
     fn aggregate(&self, return_time: i64, points: &[DataPoint]) -> Vec<DataPoint> {
@@ -24,6 +37,19 @@ impl RangeSubAggregator for AvgSub {
             return Vec::new();
         }
         let avg = numeric.iter().sum::<f64>() / numeric.len() as f64;
+        vec![DataPoint::new(return_time, avg)]
+    }
+
+    fn aggregate_columnar(
+        &self,
+        return_time: i64,
+        values: &[f64],
+        _points: &[DataPoint],
+    ) -> Vec<DataPoint> {
+        if values.is_empty() {
+            return Vec::new();
+        }
+        let avg = crate::columnar::sum(values, self.fast) / values.len() as f64;
         vec![DataPoint::new(return_time, avg)]
     }
 }
@@ -38,6 +64,15 @@ impl RangeSubAggregator for MinSub {
             .fold(f64::MAX, f64::min);
         vec![DataPoint::new(return_time, min)]
     }
+
+    fn aggregate_columnar(
+        &self,
+        return_time: i64,
+        values: &[f64],
+        _points: &[DataPoint],
+    ) -> Vec<DataPoint> {
+        vec![DataPoint::new(return_time, crate::columnar::min(values))]
+    }
 }
 
 pub struct MaxSub;
@@ -49,6 +84,15 @@ impl RangeSubAggregator for MaxSub {
             .filter_map(|p| p.value.as_f64())
             .fold(f64::MIN, f64::max);
         vec![DataPoint::new(return_time, max)]
+    }
+
+    fn aggregate_columnar(
+        &self,
+        return_time: i64,
+        values: &[f64],
+        _points: &[DataPoint],
+    ) -> Vec<DataPoint> {
+        vec![DataPoint::new(return_time, crate::columnar::max(values))]
     }
 }
 
@@ -130,7 +174,9 @@ impl SeriesAggregator for Diff {
 
 /// Java `StdAggregator`: sample standard deviation via the same running
 /// power-sum recurrence (NaN from a single point collapses to 0).
-pub struct DevSub;
+pub struct DevSub {
+    pub fast: bool,
+}
 
 impl RangeSubAggregator for DevSub {
     fn aggregate(&self, return_time: i64, points: &[DataPoint]) -> Vec<DataPoint> {
@@ -151,6 +197,21 @@ impl RangeSubAggregator for DevSub {
             std_dev = 0.0;
         }
         vec![DataPoint::new(return_time, std_dev)]
+    }
+
+    fn aggregate_columnar(
+        &self,
+        return_time: i64,
+        values: &[f64],
+        _points: &[DataPoint],
+    ) -> Vec<DataPoint> {
+        vec![DataPoint::new(return_time, crate::columnar::dev(values, self.fast))]
+    }
+
+    fn wants_columnar(&self) -> bool {
+        // The strict recurrence is sequential either way; the vectorized
+        // two-pass beats row + extraction only in fast mode.
+        self.fast
     }
 }
 
@@ -182,6 +243,35 @@ impl RangeSubAggregator for PercentileSub {
             }
         };
         vec![DataPoint::new(return_time, result)]
+    }
+
+    fn aggregate_columnar(
+        &self,
+        return_time: i64,
+        values: &[f64],
+        _points: &[DataPoint],
+    ) -> Vec<DataPoint> {
+        let mut sorted = values.to_vec();
+        sorted.sort_by(|a, b| a.partial_cmp(b).expect("non-NaN values"));
+        let result = if sorted.is_empty() {
+            0.0
+        } else {
+            let pos = self.percentile * (sorted.len() + 1) as f64;
+            if pos < 1.0 {
+                sorted[0]
+            } else if pos >= sorted.len() as f64 {
+                sorted[sorted.len() - 1]
+            } else {
+                let lower = sorted[pos as usize - 1];
+                let upper = sorted[pos as usize];
+                lower + (pos - pos.floor()) * (upper - lower)
+            }
+        };
+        vec![DataPoint::new(return_time, result)]
+    }
+
+    fn wants_columnar(&self) -> bool {
+        true
     }
 }
 
@@ -532,7 +622,7 @@ impl SeriesAggregator for SaveAs {
 
 /// Builds an [`Aggregator`] from a parsed wire spec, the analogue of the
 /// Guice-registered aggregator factory.
-pub fn build(spec: &AggregatorSpec) -> Result<Aggregator> {
+pub fn build(spec: &AggregatorSpec, fast: bool) -> Result<Aggregator> {
     let range_full = |sub: Box<dyn RangeSubAggregator>, exhaustive: bool| -> Result<Aggregator> {
         let sampling = spec
             .sampling
@@ -552,12 +642,12 @@ pub fn build(spec: &AggregatorSpec) -> Result<Aggregator> {
     let series = |agg: Box<dyn SeriesAggregator>| Ok(Aggregator::Series(agg));
 
     match spec.name.as_str() {
-        "sum" => range(Box::new(SumSub)),
-        "avg" => range(Box::new(AvgSub)),
+        "sum" => range(Box::new(SumSub { fast })),
+        "avg" => range(Box::new(AvgSub { fast })),
         "min" => range(Box::new(MinSub)),
         "max" => range(Box::new(MaxSub)),
         "count" => range(Box::new(CountSub)),
-        "dev" => range(Box::new(DevSub)),
+        "dev" => range(Box::new(DevSub { fast })),
         "percentile" => range(Box::new(PercentileSub {
             percentile: spec
                 .percentile
@@ -677,7 +767,7 @@ mod tests {
         let mut points = pts(&[(1, 2.0), (2, 4.0)]);
         points.push(DataPoint::new(3, "text"));
         assert_eq!(
-            AvgSub.aggregate(1, &points),
+            AvgSub { fast: false }.aggregate(1, &points),
             vec![DataPoint::new(1, Value::Double(3.0))]
         );
     }
@@ -712,7 +802,7 @@ mod tests {
 
     #[test]
     fn dev_is_sample_stddev() {
-        let result = DevSub.aggregate(0, &pts(&[(1, 2.0), (2, 4.0), (3, 4.0), (4, 4.0), (5, 5.0), (6, 5.0), (7, 7.0), (8, 9.0)]));
+        let result = DevSub { fast: false }.aggregate(0, &pts(&[(1, 2.0), (2, 4.0), (3, 4.0), (4, 4.0), (5, 5.0), (6, 5.0), (7, 7.0), (8, 9.0)]));
         let Value::Double(dev) = result[0].value else { panic!() };
         assert!((dev - 2.138089935).abs() < 1e-6, "got {dev}");
     }
@@ -720,7 +810,7 @@ mod tests {
     #[test]
     fn dev_of_single_point_is_zero() {
         assert_eq!(
-            DevSub.aggregate(0, &pts(&[(1, 5.0)])),
+            DevSub { fast: false }.aggregate(0, &pts(&[(1, 5.0)])),
             vec![DataPoint::new(0, Value::Double(0.0))]
         );
     }
