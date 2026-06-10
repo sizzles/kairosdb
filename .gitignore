@@ -22,3 +22,4 @@ kairosdb.conf
 queue
 big_array
 kairosdb_guid.properties
+kairosdb-rs/target/

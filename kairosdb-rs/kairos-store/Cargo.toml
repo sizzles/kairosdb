@@ -1,0 +1,10 @@
+[package]
+name = "kairos-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kairos-core = { path = "../kairos-core" }
+thiserror = { workspace = true }
+tokio = { workspace = true }

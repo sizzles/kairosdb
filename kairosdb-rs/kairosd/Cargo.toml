@@ -1,0 +1,21 @@
+[package]
+name = "kairosd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kairos-core = { path = "../kairos-core" }
+kairos-store = { path = "../kairos-store" }
+kairos-query = { path = "../kairos-query" }
+axum = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
