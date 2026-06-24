@@ -132,6 +132,8 @@ async fn main() {
     }
 
     let guard = Arc::new(guard::QueryGuard::new(&cfg.limits));
+    // Keep a handle for the post-shutdown WAL flush (AppState takes ownership).
+    let ingest_shutdown = ingest.clone();
     let app = api::router(AppState { store, ingest, rollups, guard, fast_math });
 
     let addr = cfg.listen.clone();
@@ -143,11 +145,18 @@ async fn main() {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .expect("server failed");
+    // In-flight requests have finished (so their WAL appends are done); flush
+    // the WAL to disk before exiting so records since the last periodic sync
+    // are not lost.
+    if let Err(e) = ingest_shutdown.sync_wal() {
+        tracing::error!("final wal sync failed: {e}");
+    }
     tracing::info!("shutdown complete");
 }
 
-/// SIGINT/SIGTERM stop accepting connections; the WAL fsync loop has
-/// already made queued ingest durable, so replay covers the rest.
+/// SIGINT/SIGTERM stop accepting connections; after in-flight requests drain,
+/// `main` flushes the WAL (see `sync_wal`), and replay covers anything the
+/// consumer had not yet applied to the datastore.
 async fn shutdown_signal() {
     let ctrl_c = tokio::signal::ctrl_c();
     #[cfg(unix)]

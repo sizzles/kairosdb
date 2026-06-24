@@ -71,6 +71,7 @@ fn schema() -> Arc<Schema> {
         Field::new("ts", DataType::Int64, false),
         Field::new("long_value", DataType::Int64, true),
         Field::new("double_value", DataType::Float64, true),
+        Field::new("string_value", DataType::Utf8, true),
     ]))
 }
 
@@ -81,6 +82,7 @@ struct BatchColumns<'a> {
     ts: &'a Int64Array,
     longs: &'a Int64Array,
     doubles: &'a Float64Array,
+    strings: &'a StringArray,
 }
 
 impl<'a> BatchColumns<'a> {
@@ -112,6 +114,11 @@ impl<'a> BatchColumns<'a> {
                 .as_any()
                 .downcast_ref::<Float64Array>()
                 .ok_or_else(|| pq_err("double column", "not float64"))?,
+            strings: batch
+                .column(4)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| pq_err("string column", "not utf8"))?,
         })
     }
 
@@ -191,22 +198,31 @@ impl ParquetStore {
         let mut ts_col: Vec<i64> = Vec::new();
         let mut long_col: Vec<Option<i64>> = Vec::new();
         let mut double_col: Vec<Option<f64>> = Vec::new();
+        let mut string_col: Vec<Option<String>> = Vec::new();
 
         let mut sorted: Vec<&SeriesData> = series.iter().collect();
         sorted.sort_by_key(|s| tag_string(&s.tags));
         for s in sorted {
             let key = tag_string(&s.tags);
             for p in &s.points {
-                match p.value {
+                match &p.value {
                     Value::Long(v) => {
-                        long_col.push(Some(v));
+                        long_col.push(Some(*v));
                         double_col.push(None);
+                        string_col.push(None);
                     }
                     Value::Double(v) => {
                         long_col.push(None);
-                        double_col.push(Some(v));
+                        double_col.push(Some(*v));
+                        string_col.push(None);
                     }
-                    // The cold tier is numeric-only by design.
+                    Value::Text(s) => {
+                        long_col.push(None);
+                        double_col.push(None);
+                        string_col.push(Some(s.to_string()));
+                    }
+                    // Custom/Null are not persisted to cold; the tiered
+                    // store keeps them in the hot tier (never dropped).
                     _ => continue,
                 }
                 series_col.push(key.clone());
@@ -226,6 +242,7 @@ impl ParquetStore {
                 Arc::new(Int64Array::from(ts_col)),
                 Arc::new(Int64Array::from(long_col)),
                 Arc::new(Float64Array::from(double_col)),
+                Arc::new(StringArray::from(string_col)),
             ],
         )
         .map_err(|e| pq_err("build batch", e))?;
@@ -369,12 +386,18 @@ impl ParquetStore {
                     if t < query.start_time_ms || t > query.end_time_ms {
                         continue;
                     }
-                    ts_acc.push(t);
-                    val_acc.push(if cols.longs.is_valid(row) {
+                    // The numeric columnar fast path skips string rows
+                    // (both numeric columns null); they are served via the
+                    // row path only.
+                    let v = if cols.longs.is_valid(row) {
                         cols.longs.value(row) as f64
-                    } else {
+                    } else if cols.doubles.is_valid(row) {
                         cols.doubles.value(row)
-                    });
+                    } else {
+                        continue;
+                    };
+                    ts_acc.push(t);
+                    val_acc.push(v);
                 }
             }
             if let Some((tags, keep, ts, vals)) = run.take() {
@@ -440,8 +463,12 @@ impl ParquetStore {
                 }
                 let value = if cols.longs.is_valid(row) {
                     Value::Long(cols.longs.value(row))
-                } else {
+                } else if cols.doubles.is_valid(row) {
                     Value::Double(cols.doubles.value(row))
+                } else if cols.strings.is_valid(row) {
+                    Value::Text(cols.strings.value(row).into())
+                } else {
+                    continue;
                 };
                 out.last_mut()
                     .expect("series pushed above")
@@ -553,6 +580,31 @@ mod tests {
             limit: None,
             descending: false,
         }
+    }
+
+    #[test]
+    fn scan_columns_skips_string_rows() {
+        // Regression guard for the string-column fix: a partition holding a
+        // double, a long, and a string must expose ONLY the two numeric rows
+        // to the columnar (numeric-aggregation) path — the string must not be
+        // read as 0.0 and pollute sums/averages.
+        let (store, dir) = store();
+        let mut s = series(&[("h", "a")], &[(1_000, 99.5)]);
+        s.points.push(DataPoint::new(2_000, 7i64));
+        s.points.push(DataPoint::new(3_000, "SETTLED"));
+        store.write_partition("m", 0, &[s]).unwrap();
+
+        // Row path returns all three (incl. the string).
+        let rows = store.query(&q("m", 0, 10_000)).unwrap();
+        assert_eq!(rows[0].points.len(), 3);
+        assert_eq!(rows[0].points[2].value, Value::Text("SETTLED".into()));
+
+        // Columnar path returns only the two numeric values, in order.
+        let cols = store.scan_columns(&q("m", 0, 10_000)).unwrap();
+        assert_eq!(cols.len(), 1);
+        assert_eq!(cols[0].timestamps, vec![1_000, 2_000]);
+        assert_eq!(cols[0].values, vec![99.5, 7.0]);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -26,10 +26,15 @@ struct RunningQuery {
     abort: AbortHandle,
 }
 
-pub struct QueryPermit<'a> {
+/// Held for the lifetime of a query; releasing it frees the concurrency slot.
+pub struct SlotPermit<'a> {
+    _permit: Option<tokio::sync::SemaphorePermit<'a>>,
+}
+
+/// Held while a query is running; on drop it deregisters from the running list.
+pub struct QueryRegistration<'a> {
     guard: &'a QueryGuard,
     id: u64,
-    _permit: Option<tokio::sync::SemaphorePermit<'a>>,
 }
 
 impl QueryGuard {
@@ -45,14 +50,12 @@ impl QueryGuard {
         }
     }
 
-    /// Waits for a concurrency slot (bounded by the query timeout, so a full
-    /// server sheds load instead of queueing forever) and registers the
-    /// query as running.
-    pub async fn admit(
-        &self,
-        summary: String,
-        abort: AbortHandle,
-    ) -> Result<QueryPermit<'_>, String> {
+    /// Acquire a concurrency slot. This must be awaited **before** the query
+    /// work is spawned, so `max_concurrent_queries` bounds actual execution
+    /// (not just the number of handlers waiting on a join). The wait is
+    /// bounded by the query timeout, so a saturated server sheds load with a
+    /// 503 instead of queueing forever.
+    pub async fn acquire(&self) -> Result<SlotPermit<'_>, String> {
         let permit = match &self.semaphore {
             None => None,
             Some(semaphore) => {
@@ -66,12 +69,18 @@ impl QueryGuard {
                 Some(permit.map_err(|_| "query guard closed".to_string())?)
             }
         };
+        Ok(SlotPermit { _permit: permit })
+    }
+
+    /// Register a now-running query so it appears in `/runningqueries` and can
+    /// be aborted via `/killquery/{id}`. The returned guard deregisters on drop.
+    pub fn register(&self, summary: String, abort: AbortHandle) -> QueryRegistration<'_> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.running.lock().expect("guard lock poisoned").insert(
             id,
             RunningQuery { summary, started: Instant::now(), abort },
         );
-        Ok(QueryPermit { guard: self, id, _permit: permit })
+        QueryRegistration { guard: self, id }
     }
 
     pub fn running(&self) -> Vec<serde_json::Value> {
@@ -104,7 +113,7 @@ impl QueryGuard {
     }
 }
 
-impl Drop for QueryPermit<'_> {
+impl Drop for QueryRegistration<'_> {
     fn drop(&mut self) {
         self.guard
             .running

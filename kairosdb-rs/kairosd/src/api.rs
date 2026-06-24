@@ -100,7 +100,8 @@ async fn metric_names(
 /// accepted), each carrying `tags` plus either `datapoints: [[ts, value]]`
 /// or a single `timestamp`/`value` pair. The body may be gzip-compressed
 /// (`Content-Encoding: gzip`), as the Java server accepts. Sets are
-/// acknowledged once durable in the WAL and queued, not once stored.
+/// acknowledged once appended to the WAL and queued (group-commit fsync
+/// within ~100ms, or on shutdown), not once stored in the datastore.
 async fn add_datapoints(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -294,21 +295,25 @@ async fn query_datapoints_guarded(
         .collect::<Vec<_>>()
         .join(",");
 
+    // Acquire a concurrency slot BEFORE spawning the work, so the cap bounds
+    // real execution and a saturated server sheds load (503) instead of
+    // running every query at once.
+    let _slot = state
+        .guard
+        .acquire()
+        .await
+        .map_err(|e| ApiError(StatusCode::SERVICE_UNAVAILABLE, e))?;
+
     let inner_state = state.clone();
     let task = tokio::spawn(query_datapoints_inner(inner_state, request));
     let abort = task.abort_handle();
-    let permit = state
-        .guard
-        .admit(summary, abort.clone())
-        .await
-        .map_err(|e| ApiError(StatusCode::SERVICE_UNAVAILABLE, e))?;
+    let _reg = state.guard.register(summary, abort.clone());
 
     let joined = match state.guard.timeout {
         Some(timeout) => match tokio::time::timeout(timeout, task).await {
             Ok(joined) => joined,
             Err(_) => {
                 abort.abort();
-                drop(permit);
                 return Err(ApiError(
                     StatusCode::SERVICE_UNAVAILABLE,
                     format!("query exceeded the {}ms time budget", timeout.as_millis()),
@@ -317,7 +322,6 @@ async fn query_datapoints_guarded(
         },
         None => task.await,
     };
-    drop(permit);
     match joined {
         Ok(result) => result,
         Err(e) if e.is_cancelled() => Err(ApiError(

@@ -48,20 +48,29 @@ impl<H: Datastore> TieredDatastore<H> {
                 continue;
             }
 
-            // Split per partition window; non-numeric points stay hot.
+            // Split per partition window. Long/Double/Text go to the cold
+            // tier; Custom/Null cannot be represented there, so they are kept
+            // in hot — compaction must never silently drop them.
             let mut windows: BTreeMap<i64, BTreeMap<Tags, Vec<DataPoint>>> = BTreeMap::new();
+            let mut keep_hot: Vec<(Tags, DataPoint)> = Vec::new();
             for s in &series {
                 for p in &s.points {
-                    if !matches!(p.value, Value::Long(_) | Value::Double(_)) {
-                        continue;
+                    if matches!(p.value, Value::Long(_) | Value::Double(_) | Value::Text(_)) {
+                        windows
+                            .entry(self.cold.window_start(p.timestamp_ms))
+                            .or_default()
+                            .entry(s.tags.clone())
+                            .or_default()
+                            .push(p.clone());
+                    } else {
+                        keep_hot.push((s.tags.clone(), p.clone()));
                     }
-                    windows
-                        .entry(self.cold.window_start(p.timestamp_ms))
-                        .or_default()
-                        .entry(s.tags.clone())
-                        .or_default()
-                        .push(p.clone());
                 }
+            }
+            // If nothing in range can go to cold, leave the metric untouched
+            // rather than deleting points we never persisted.
+            if windows.is_empty() {
+                continue;
             }
 
             for (window, by_tags) in windows {
@@ -100,6 +109,15 @@ impl<H: Datastore> TieredDatastore<H> {
                 .expect("clock before epoch")
                 .as_millis() as i64;
             self.hot.delete_at(&query, now_ms).await?;
+            // Restore points the cold tier cannot hold (Custom/Null), which
+            // the range delete above also removed. Re-inserted into hot so
+            // compaction is non-destructive for every value type.
+            for (tags, point) in keep_hot {
+                let mut set = DataPointSet::new(&metric);
+                set.tags = tags;
+                set.points = vec![point];
+                self.hot.write(set).await?;
+            }
             // Drop orphaned index entries for fully-compacted windows so
             // the hot-emptiness check on reads stays cheap.
             let mut purge = query.clone();
@@ -246,6 +264,53 @@ mod tests {
             limit: None,
             descending: false,
         }
+    }
+
+    #[tokio::test]
+    async fn compaction_preserves_string_and_custom_points() {
+        // Regression: compaction skipped non-numeric points when writing
+        // cold, then hard-deleted the whole range from hot — losing them.
+        let (store, dir) = tiered();
+        store
+            .write(
+                DataPointSet::new("m")
+                    .tag("h", "a")
+                    .point(1_000, 12.5) // double -> cold
+                    .point(2_000, 7i64) // long  -> cold
+                    .point(3_000, "settled"), // text -> cold (was lost!)
+            )
+            .await
+            .unwrap();
+        // A metric whose only old point is a string must also survive.
+        store
+            .write(DataPointSet::new("s").tag("h", "b").point(1_000, "open"))
+            .await
+            .unwrap();
+
+        let moved = store.compact(500_000_000).await.unwrap();
+        // m: double+long+text (3) and s: text (1) all move to cold.
+        assert_eq!(moved, 4, "all 4 points (incl. strings) should move to cold");
+
+        // Nothing left in hot for the numeric metric, everything in cold.
+        assert!(store.hot().query(&q("m", 0, 10_000)).await.unwrap().is_empty());
+        let m = store.query(&q("m", 0, 10_000)).await.unwrap();
+        assert_eq!(m.len(), 1);
+        let vals: Vec<&Value> = m[0].points.iter().map(|p| &p.value).collect();
+        assert_eq!(
+            vals,
+            vec![
+                &Value::Double(12.5),
+                &Value::Long(7),
+                &Value::Text("settled".into())
+            ],
+            "string point must not be dropped by compaction"
+        );
+
+        // The string-only metric is fully preserved (it has nothing numeric,
+        // but its string still round-trips through the cold tier).
+        let s = store.query(&q("s", 0, 10_000)).await.unwrap();
+        assert_eq!(s[0].points[0].value, Value::Text("open".into()));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

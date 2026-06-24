@@ -36,7 +36,7 @@ share a Cassandra keyspace.
 
 | | Java 1.4.0-SNAPSHOT | kairosd (release) |
 |---|---|---|
-| Ingest ack rate | ~80k pts/s | ~510k pts/s (WAL-durable) |
+| Ingest ack rate | ~80k pts/s | ~510k pts/s (WAL group-commit, fsync ≤100ms) |
 | Ingest → queryable | ~40–50k pts/s | ~75–90k pts/s |
 | Query 100k points (avg to 1h buckets) | ~105–115 ms | ~80–95 ms |
 
@@ -89,8 +89,9 @@ stays cheap.
 Measured in this container: a 1.05M-point aggregated historical scan
 answers in **~85 ms (≈12 M pts/s)** through the full HTTP stack vs
 ~1.0–2.1 s from Cassandra; the raw columnar scan runs at ~40 M pts/s. The
-data sits in a 7 MB footprint (~7 bytes/point). Text/custom values stay in
-the hot store; the cold tier is numeric-only.
+data sits in a 7 MB footprint (~7 bytes/point). Long, double, and string
+values all persist to the cold tier; `Custom`/`Null` values (not produced by
+the ingest API) are kept in the hot tier so compaction never drops them.
 
 Profiling finding (`examples/profile_stages.rs`): with row-form
 `Vec<DataPoint>` input the pipeline is bound by point-struct memory traffic,

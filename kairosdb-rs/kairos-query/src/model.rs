@@ -287,7 +287,11 @@ fn merge_columns(mut members: Vec<kairos_core::ColumnSeries>) -> (Vec<i64>, Vec<
     for m in members {
         pairs.extend(m.timestamps.into_iter().zip(m.values));
     }
-    pairs.sort_unstable_by_key(|(ts, _)| *ts);
+    // Stable sort: equal-timestamp points keep source order, matching the
+    // row path's `sort_by_key` (model.rs execute). An unstable sort here
+    // reorders cross-series ties, which changes strict-mode sum/avg/dev in
+    // the last ulp and breaks columnar==row bit-identity.
+    pairs.sort_by_key(|(ts, _)| *ts);
     pairs.into_iter().unzip()
 }
 
@@ -768,6 +772,30 @@ mod tests {
         // Sanity on the math: bucket [0,100): 1+2+10=13 *2; [100,200): 3*2.
         assert_eq!(col_results[0].points[0].value, kairos_core::Value::Double(26.0));
         assert_eq!(col_results[0].points[1].value, kairos_core::Value::Double(6.0));
+    }
+
+    #[test]
+    fn columnar_equals_row_on_cross_series_timestamp_ties() {
+        // Three series share timestamp t with values whose float sum depends
+        // on order. The columnar merge must preserve source order (stable
+        // sort) so its strict sum is bit-identical to the row path.
+        let metric = parse_metric(
+            r#"{"name": "m", "aggregators": [
+                {"name": "sum", "sampling": {"value": 1, "unit": "hours"},
+                 "align_sampling": false}]}"#,
+        );
+        let cols = vec![
+            kairos_core::ColumnSeries { tags: [("s".to_string(), "a".to_string())].into(), timestamps: vec![10], values: vec![1e16] },
+            kairos_core::ColumnSeries { tags: [("s".to_string(), "b".to_string())].into(), timestamps: vec![10], values: vec![1.0] },
+            kairos_core::ColumnSeries { tags: [("s".to_string(), "c".to_string())].into(), timestamps: vec![10], values: vec![-1e16] },
+        ];
+        let rows: Vec<SeriesInput> = cols
+            .iter()
+            .map(|c| SeriesInput { tags: c.tags.clone(), points: c.to_points() })
+            .collect();
+        let (col, _) = execute_columnar(&metric, cols, 0, i64::MAX, kairos_core::time::UTC, false).unwrap();
+        let (row, _) = execute(&metric, rows, 0, i64::MAX, kairos_core::time::UTC, false).unwrap();
+        assert_eq!(col[0].points, row[0].points, "columnar and row strict sums must be bit-identical");
     }
 
     #[test]

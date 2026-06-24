@@ -7,7 +7,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use kairos_core::DataPointSet;
 use kairos_store::wal::{Wal, WalPosition};
 use kairos_store::Datastore;
@@ -55,6 +55,13 @@ impl Ingest {
         let consumer_wal = wal.clone();
         tokio::spawn(async move {
             let mut batch = Vec::with_capacity(BATCH_SIZE);
+            // The earliest WAL position whose datastore write failed. We must
+            // never checkpoint at or past it: that record (and everything
+            // after) has to stay replayable. Without this, a max-position
+            // checkpoint could leap over an earlier failed-but-acked set and
+            // silently lose it on restart.
+            let mut first_failed: Option<WalPosition> = None;
+            let mut last_checkpointed: Option<WalPosition> = None;
             loop {
                 batch.clear();
                 match rx.recv().await {
@@ -69,26 +76,43 @@ impl Ingest {
                     }
                 }
 
-                // Sets are independent; drain the batch concurrently. Only
-                // checkpoint when everything landed — failed sets stay in
-                // the WAL for replay on restart.
-                let batch_pos = batch.iter().filter_map(|(_, pos)| *pos).max();
-                let results: Vec<Result<(), kairos_store::Error>> =
-                    futures::stream::iter(batch.drain(..).map(|(set, _)| store.write(set)))
-                        .buffer_unordered(WRITE_CONCURRENCY)
-                        .collect()
-                        .await;
-                let mut all_ok = true;
-                for result in results {
+                // Drain concurrently; each result carries its WAL position so
+                // we know exactly which set failed (buffer_unordered yields in
+                // completion order, so the position must travel with it).
+                let results: Vec<(Option<WalPosition>, Result<(), kairos_store::Error>)> =
+                    futures::stream::iter(
+                        batch
+                            .drain(..)
+                            .map(|(set, pos)| store.write(set).map(move |r| (pos, r))),
+                    )
+                    .buffer_unordered(WRITE_CONCURRENCY)
+                    .collect()
+                    .await;
+
+                for (pos, result) in &results {
                     if let Err(e) = result {
-                        all_ok = false;
                         tracing::error!("datastore write failed: {e}");
+                        if let Some(p) = pos {
+                            first_failed = Some(first_failed.map_or(*p, |f| f.min(*p)));
+                        }
                     }
                 }
-                if all_ok {
-                    if let (Some(wal), Some(pos)) = (&consumer_wal, batch_pos) {
+
+                // Highest successful position safe to checkpoint: the batch
+                // max, clamped to strictly before the earliest failure ever
+                // seen so the failed record stays in the WAL for replay.
+                let candidate = results
+                    .iter()
+                    .filter_map(|(p, r)| if r.is_ok() { *p } else { None })
+                    .filter(|p| first_failed.is_none_or(|f| *p < f))
+                    .max();
+
+                if let (Some(wal), Some(pos)) = (&consumer_wal, candidate) {
+                    if last_checkpointed.is_none_or(|c| pos > c) {
                         if let Err(e) = wal.checkpoint(pos) {
                             tracing::error!("wal checkpoint failed: {e}");
+                        } else {
+                            last_checkpointed = Some(pos);
                         }
                     }
                 }
@@ -110,8 +134,10 @@ impl Ingest {
         Ok(Ingest { tx, wal })
     }
 
-    /// Durable enqueue: WAL append, then hand to the consumer. Applies
-    /// backpressure when the queue is full.
+    /// Enqueue durably: append to the WAL, then hand to the consumer. The
+    /// record is fsynced by the periodic sync task (within `WAL_SYNC_INTERVAL`)
+    /// or by `sync_wal()` on shutdown — not per call. Applies backpressure
+    /// when the queue is full.
     pub async fn submit(&self, set: DataPointSet) -> Result<(), kairos_store::Error> {
         let pos = match &self.wal {
             Some(wal) => Some(wal.append(&set)?),
@@ -121,5 +147,15 @@ impl Ingest {
             .send((set, pos))
             .await
             .map_err(|_| kairos_store::Error::Datastore("ingest queue closed".into()))
+    }
+
+    /// Flush and fsync the WAL. Called on graceful shutdown so records
+    /// appended in the gap since the last periodic sync reach disk before the
+    /// process exits (mirrors Java FileQueueProcessor's flush-on-shutdown).
+    pub fn sync_wal(&self) -> Result<(), kairos_store::Error> {
+        match &self.wal {
+            Some(wal) => wal.sync(),
+            None => Ok(()),
+        }
     }
 }

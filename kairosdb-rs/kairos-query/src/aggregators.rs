@@ -746,7 +746,7 @@ pub fn build(spec: &AggregatorSpec, fast: bool) -> Result<Aggregator> {
             ),
         })),
         "score" => {
-            let thresholds = spec
+            let mut thresholds: Vec<Threshold> = spec
                 .thresholds
                 .as_ref()
                 .filter(|t| !t.is_empty())
@@ -757,6 +757,10 @@ pub fn build(spec: &AggregatorSpec, fast: bool) -> Result<Aggregator> {
                     inferior: t.boundary.as_deref().is_some_and(|b| b.eq_ignore_ascii_case("inferior")),
                 })
                 .collect();
+            // Java ScoreAggregator.setThresholds sorts ascending by value
+            // (Threshold.compareTo -> compareValue); the scoring loop then
+            // returns the index of the first threshold the value falls below.
+            thresholds.sort_by(|a, b| a.value.partial_cmp(&b.value).expect("non-NaN threshold"));
             series(Box::new(Score {
                 thresholds,
                 descending: spec
@@ -928,6 +932,21 @@ mod new_aggregator_tests {
         let scores: Vec<f64> = result.iter().filter_map(|p| p.value.as_f64()).collect();
         // 10.0 with a superior boundary scores below the threshold.
         assert_eq!(scores, vec![0.0, 0.0, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn score_sorts_thresholds_like_java() {
+        // Thresholds supplied OUT of ascending order; Java sorts them, so a
+        // value of 15 must score 1 (it sits in [10, 20)), not 0.
+        let spec: AggregatorSpec = serde_json::from_value(serde_json::json!({
+            "name": "score",
+            "thresholds": [{"value": 20.0}, {"value": 10.0}]
+        }))
+        .unwrap();
+        let agg = build(&spec, false).unwrap();
+        let ctx = crate::test_context(0, 100);
+        let result = agg.run(&ctx, pts(&[(1, 15.0)]));
+        assert_eq!(result[0].value, Value::Double(1.0));
     }
 
     #[test]

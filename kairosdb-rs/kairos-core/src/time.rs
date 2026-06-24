@@ -6,7 +6,7 @@
 //! Calendar math honors a per-query time zone (Java `TimezoneAware`),
 //! defaulting to UTC.
 
-use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Timelike};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveDateTime, TimeZone, Timelike};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 
@@ -149,30 +149,44 @@ pub fn align_range_boundary(ts_ms: i64, unit: TimeUnit) -> i64 {
 
 pub fn align_range_boundary_tz(ts_ms: i64, unit: TimeUnit, tz: Tz) -> i64 {
     let dt = in_tz(ts_ms, tz);
-    let dt = match unit {
-        TimeUnit::Years => start_of_day(dt.with_month(1).unwrap().with_day(1).unwrap()),
-        TimeUnit::Months => start_of_day(dt.with_day(1).unwrap()),
+    let date = dt.date_naive();
+    // All field manipulation happens on Naive types, which have no DST gaps,
+    // so the .unwrap()s here are infallible (month 1 / day 1 / 00:00:00 always
+    // exist). The single local->instant resolution at the end is the only
+    // place a DST gap can appear, and resolve_local handles it.
+    let naive: NaiveDateTime = match unit {
+        TimeUnit::Years => date
+            .with_day(1)
+            .unwrap()
+            .with_month(1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap(),
+        TimeUnit::Months => date.with_day(1).unwrap().and_hms_opt(0, 0, 0).unwrap(),
         TimeUnit::Weeks => {
             let days_from_monday = i64::from(dt.weekday().num_days_from_monday());
-            start_of_day(dt - Duration::days(days_from_monday))
+            (date - Duration::days(days_from_monday))
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
         }
         TimeUnit::Days | TimeUnit::Hours | TimeUnit::Minutes | TimeUnit::Seconds => {
-            start_of_day(dt)
+            date.and_hms_opt(0, 0, 0).unwrap()
         }
-        TimeUnit::Milliseconds => dt.with_nanosecond(0).unwrap(),
+        TimeUnit::Milliseconds => dt.naive_local().with_nanosecond(0).unwrap(),
     };
-    dt.timestamp_millis()
+    resolve_local(naive, tz).timestamp_millis()
 }
 
-fn start_of_day(dt: DateTime<Tz>) -> DateTime<Tz> {
-    dt.with_hour(0)
-        .unwrap()
-        .with_minute(0)
-        .unwrap()
-        .with_second(0)
-        .unwrap()
-        .with_nanosecond(0)
-        .unwrap()
+/// Resolve a local naive time to an instant, shifting forward out of a DST
+/// gap (mirrors Joda's withMillisOfDay(0) behavior and `add_units_tz`).
+fn resolve_local(naive: NaiveDateTime, tz: Tz) -> DateTime<Tz> {
+    match tz.from_local_datetime(&naive) {
+        chrono::LocalResult::Single(d) | chrono::LocalResult::Ambiguous(d, _) => d,
+        chrono::LocalResult::None => tz
+            .from_local_datetime(&(naive + Duration::hours(1)))
+            .earliest()
+            .expect("valid shifted local time"),
+    }
 }
 
 /// Range bucketing, replicating `RangeAggregator.getStartRange`/`getEndRange`.
@@ -270,5 +284,31 @@ mod tests {
     fn negative_difference_truncates_toward_zero() {
         assert_eq!(unit_difference(-1_500, 0, TimeUnit::Seconds), -1);
         assert_eq!(unit_difference(1_500, 0, TimeUnit::Seconds), 1);
+    }
+
+    #[test]
+    fn align_does_not_panic_in_dst_gap() {
+        // São Paulo sprang forward at 2018-11-04 00:00 (midnight does not
+        // exist locally). This used to panic on with_hour(0).unwrap().
+        let sp = chrono_tz::America::Sao_Paulo;
+        // 2018-11-04 12:00 local, an instant on the transition day.
+        let ts = sp
+            .with_ymd_and_hms(2018, 11, 4, 12, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        for unit in [
+            TimeUnit::Days,
+            TimeUnit::Hours,
+            TimeUnit::Minutes,
+            TimeUnit::Weeks,
+            TimeUnit::Months,
+            TimeUnit::Years,
+        ] {
+            let aligned = align_range_boundary_tz(ts, unit, sp);
+            // Resolves to the first valid instant of the day (01:00 local,
+            // since 00:00 was skipped) rather than crashing.
+            assert!(aligned <= ts, "{unit:?} boundary must not be after the point");
+        }
     }
 }
