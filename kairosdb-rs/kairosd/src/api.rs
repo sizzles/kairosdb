@@ -11,6 +11,7 @@ use kairos_core::{DataPoint, DataPointSet, Value};
 use kairos_query::model::{GroupResult, MetricQuery, QueryRequest, SeriesInput};
 use kairos_store::{Datastore, DatastoreQuery};
 use serde_json::{json, Value as JsonValue};
+use tower_http::cors::{Any, CorsLayer};
 
 use crate::guard::QueryGuard;
 use crate::ingest::Ingest;
@@ -35,6 +36,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/metricnames", get(metric_names))
         .route("/api/v1/datapoints", post(add_datapoints).put(add_datapoints))
         .route("/api/v1/datapoints/query", post(query_datapoints))
+        .route("/api/v1/query/grid", get(query_grid))
         .route("/api/v1/datapoints/query/tags", post(query_metric_tags))
         .route("/api/v1/datapoints/delete", post(delete_datapoints))
         .route("/api/v1/metric/{name}", delete(delete_metric))
@@ -50,6 +52,15 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/v1/rollups/{id}",
             delete(delete_rollup).get(get_rollup),
+        )
+        // Office.js add-ins run in a browser sandbox and issue cross-origin
+        // requests. Permissive CORS is fine for a self-hosted demo; restrict
+        // the allowed origins before exposing this anywhere real.
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any),
         )
         .with_state(state)
 }
@@ -589,6 +600,96 @@ async fn delete_rollup(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Flat query params for the BI/Excel-friendly grid endpoint.
+#[derive(serde::Deserialize)]
+struct GridParams {
+    metric: String,
+    /// Window start, epoch milliseconds (inclusive).
+    start: i64,
+    /// Window end, epoch milliseconds. Defaults to now.
+    end: Option<i64>,
+    /// Aggregator name (`avg`, `sum`, `max`, …). Omit for raw points.
+    aggregator: Option<String>,
+    sampling_value: Option<i64>,
+    /// Sampling unit (`minutes`, `hours`, `days`, …).
+    sampling_unit: Option<String>,
+    align_sampling: Option<bool>,
+    /// Comma-separated tag filter, e.g. `host=a,dc=lga`.
+    tags: Option<String>,
+    limit: Option<usize>,
+}
+
+/// `GET /api/v1/query/grid` — server-side aggregation shaped for a client
+/// that wants a 2D array (e.g. an Excel custom function that spills it into a
+/// sheet). Returns `rows: [[timestamp_ms, value], …]` for the first result
+/// series, plus `sample_size` (raw points scanned) and `elapsed_ms` — the
+/// numbers behind "aggregated N points in X ms". Because the aggregation
+/// happens here, the client can explore datasets far larger than its grid
+/// could ever hold. The point budget (`max_query_points`) still applies.
+async fn query_grid(
+    State(state): State<AppState>,
+    Query(p): Query<GridParams>,
+) -> Result<Json<JsonValue>, ApiError> {
+    let started = std::time::Instant::now();
+    let end = p.end.unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+
+    // Reuse the full query deserializer rather than hand-build a MetricQuery.
+    let mut metric = json!({ "name": p.metric });
+    if let Some(limit) = p.limit {
+        metric["limit"] = json!(limit);
+    }
+    if let Some(tags) = &p.tags {
+        let mut map = serde_json::Map::new();
+        for pair in tags.split(',').filter(|s| !s.is_empty()) {
+            if let Some((k, v)) = pair.split_once('=') {
+                map.insert(k.to_string(), json!(v));
+            }
+        }
+        if !map.is_empty() {
+            metric["tags"] = JsonValue::Object(map);
+        }
+    }
+    if let Some(agg) = &p.aggregator {
+        let mut a = json!({ "name": agg, "align_sampling": p.align_sampling.unwrap_or(true) });
+        if let (Some(value), Some(unit)) = (p.sampling_value, &p.sampling_unit) {
+            a["sampling"] = json!({ "value": value, "unit": unit });
+        }
+        metric["aggregators"] = json!([a]);
+    }
+
+    let mq: MetricQuery = serde_json::from_value(metric)
+        .map_err(|e| bad_request(format!("invalid grid query: {e}")))?;
+
+    crate::metrics::inc(&crate::metrics::QUERIES);
+    let (sample_size, groups, _saved) = run_metric_query(
+        &state.store,
+        &mq,
+        p.start,
+        end,
+        kairos_core::time::UTC,
+        state.fast_math,
+        state.guard.max_points,
+    )
+    .await
+    .map_err(bad_request)?;
+    crate::metrics::add(&crate::metrics::QUERY_SAMPLE_POINTS, sample_size as u64);
+
+    let rows: Vec<JsonValue> = groups
+        .first()
+        .map(|g| g.points.iter().map(value_pair).collect())
+        .unwrap_or_default();
+    let row_count = rows.len();
+
+    Ok(Json(json!({
+        "metric": p.metric,
+        "columns": ["timestamp", "value"],
+        "rows": rows,
+        "row_count": row_count,
+        "sample_size": sample_size,
+        "elapsed_ms": started.elapsed().as_millis(),
+    })))
+}
+
 fn value_pair(point: &DataPoint) -> JsonValue {
     let value = match &point.value {
         Value::Long(v) => json!(v),
@@ -659,6 +760,35 @@ mod tests {
             serde_json::from_slice(&bytes).unwrap()
         };
         (status, json)
+    }
+
+    #[tokio::test]
+    async fn grid_endpoint_returns_spillable_rows() {
+        let app = memory_router().await;
+        send(
+            &app,
+            "POST",
+            "/api/v1/datapoints",
+            json!([{"name": "grid.m", "tags": {"h": "a"},
+                    "datapoints": [[1000, 10.0], [61000, 20.0], [121000, 30.0]]}]),
+        )
+        .await;
+        settle().await;
+
+        // 2-minute avg buckets over the three points: [0,120s)=avg(10,20)=15, [120s,240s)=30.
+        let (status, body) = send(
+            &app,
+            "GET",
+            "/api/v1/query/grid?metric=grid.m&start=0&end=200000&aggregator=avg&sampling_value=2&sampling_unit=minutes&align_sampling=false",
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["columns"], json!(["timestamp", "value"]));
+        assert_eq!(body["rows"], json!([[1000, 15.0], [121000, 30.0]]));
+        assert_eq!(body["row_count"], 2);
+        assert_eq!(body["sample_size"], 3); // three raw points were scanned
+        assert!(body["elapsed_ms"].is_number());
     }
 
     #[tokio::test]

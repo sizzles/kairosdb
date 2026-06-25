@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=Edge" />
+    <title>KairosDB-rs</title>
+    <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+    <style>
+      body { font-family: Segoe UI, sans-serif; margin: 16px; color: #222; }
+      code { background: #f3f3f3; padding: 1px 4px; border-radius: 3px; }
+      h2 { margin-top: 0; }
+    </style>
+  </head>
+  <body>
+    <h2>KairosDB-rs</h2>
+    <p>Server-side aggregated time-series queries as Excel functions.</p>
+    <ul>
+      <li><code>=KAIROS.QUERY(metric, start, end, [agg], [bucket], [tags], [url])</code></li>
+      <li><code>=KAIROS.INFO(metric, start, end, [agg], [bucket], [tags], [url])</code></li>
+      <li><code>=KAIROS.METRICS([prefix], [url])</code></li>
+    </ul>
+    <p>
+      Example:
+      <br /><code>=KAIROS.QUERY("sensor.temp", DATE(2020,1,1), TODAY(), "avg", "1d")</code>
+    </p>
+    <p>Point it at a running <code>kairosd</code> (default <code>http://localhost:8080</code>).</p>
+  </body>
+</html>
