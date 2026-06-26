@@ -37,6 +37,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/datapoints", post(add_datapoints).put(add_datapoints))
         .route("/api/v1/datapoints/query", post(query_datapoints))
         .route("/api/v1/query/grid", get(query_grid))
+        .route("/api/v1/query/pivot", get(query_pivot))
         .route("/api/v1/datapoints/query/tags", post(query_metric_tags))
         .route("/api/v1/datapoints/delete", post(delete_datapoints))
         .route("/api/v1/metric/{name}", delete(delete_metric))
@@ -616,29 +617,25 @@ struct GridParams {
     align_sampling: Option<bool>,
     /// Comma-separated tag filter, e.g. `host=a,dc=lga`.
     tags: Option<String>,
+    /// Viewport paging: first result row to return (default 0).
+    offset: Option<usize>,
+    /// Viewport paging: number of rows to return (default all from offset).
     limit: Option<usize>,
 }
 
-/// `GET /api/v1/query/grid` — server-side aggregation shaped for a client
-/// that wants a 2D array (e.g. an Excel custom function that spills it into a
-/// sheet). Returns `rows: [[timestamp_ms, value], …]` for the first result
-/// series, plus `sample_size` (raw points scanned) and `elapsed_ms` — the
-/// numbers behind "aggregated N points in X ms". Because the aggregation
-/// happens here, the client can explore datasets far larger than its grid
-/// could ever hold. The point budget (`max_query_points`) still applies.
-async fn query_grid(
-    State(state): State<AppState>,
-    Query(p): Query<GridParams>,
-) -> Result<Json<JsonValue>, ApiError> {
-    let started = std::time::Instant::now();
-    let end = p.end.unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
-
-    // Reuse the full query deserializer rather than hand-build a MetricQuery.
-    let mut metric = json!({ "name": p.metric });
-    if let Some(limit) = p.limit {
-        metric["limit"] = json!(limit);
-    }
-    if let Some(tags) = &p.tags {
+/// Build a single-metric `MetricQuery` JSON from flat params; optional
+/// `group_by` tag pivots the result into one series per distinct tag value.
+fn grid_metric_json(
+    metric: &str,
+    aggregator: &Option<String>,
+    sampling_value: Option<i64>,
+    sampling_unit: &Option<String>,
+    align_sampling: Option<bool>,
+    tags: &Option<String>,
+    group_by_tag: Option<&str>,
+) -> JsonValue {
+    let mut m = json!({ "name": metric });
+    if let Some(tags) = tags {
         let mut map = serde_json::Map::new();
         for pair in tags.split(',').filter(|s| !s.is_empty()) {
             if let Some((k, v)) = pair.split_once('=') {
@@ -646,17 +643,44 @@ async fn query_grid(
             }
         }
         if !map.is_empty() {
-            metric["tags"] = JsonValue::Object(map);
+            m["tags"] = JsonValue::Object(map);
         }
     }
-    if let Some(agg) = &p.aggregator {
-        let mut a = json!({ "name": agg, "align_sampling": p.align_sampling.unwrap_or(true) });
-        if let (Some(value), Some(unit)) = (p.sampling_value, &p.sampling_unit) {
+    if let Some(agg) = aggregator {
+        let mut a = json!({ "name": agg, "align_sampling": align_sampling.unwrap_or(true) });
+        if let (Some(value), Some(unit)) = (sampling_value, sampling_unit) {
             a["sampling"] = json!({ "value": value, "unit": unit });
         }
-        metric["aggregators"] = json!([a]);
+        m["aggregators"] = json!([a]);
     }
+    if let Some(tag) = group_by_tag {
+        m["group_by"] = json!([{ "name": "tag", "tags": [tag] }]);
+    }
+    m
+}
 
+/// `GET /api/v1/query/grid` — server-side aggregation shaped as a **paged
+/// viewport**: returns a slice (`offset`..`offset+limit`) of the aggregated
+/// result rows plus `total_rows`, so an Excel scrollbar bound to `offset` can
+/// scroll a window over a result far larger than the grid could hold. Also
+/// reports `sample_size` (raw points scanned) and `elapsed_ms`. The point
+/// budget (`max_query_points`) still applies.
+async fn query_grid(
+    State(state): State<AppState>,
+    Query(p): Query<GridParams>,
+) -> Result<Json<JsonValue>, ApiError> {
+    let started = std::time::Instant::now();
+    let end = p.end.unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+
+    let metric = grid_metric_json(
+        &p.metric,
+        &p.aggregator,
+        p.sampling_value,
+        &p.sampling_unit,
+        p.align_sampling,
+        &p.tags,
+        None,
+    );
     let mq: MetricQuery = serde_json::from_value(metric)
         .map_err(|e| bad_request(format!("invalid grid query: {e}")))?;
 
@@ -674,17 +698,126 @@ async fn query_grid(
     .map_err(bad_request)?;
     crate::metrics::add(&crate::metrics::QUERY_SAMPLE_POINTS, sample_size as u64);
 
-    let rows: Vec<JsonValue> = groups
-        .first()
-        .map(|g| g.points.iter().map(value_pair).collect())
-        .unwrap_or_default();
-    let row_count = rows.len();
+    let all: Vec<&DataPoint> = groups.first().map(|g| g.points.iter().collect()).unwrap_or_default();
+    let total_rows = all.len();
+    let offset = p.offset.unwrap_or(0).min(total_rows);
+    let end_row = p.limit.map_or(total_rows, |n| (offset + n).min(total_rows));
+    let rows: Vec<JsonValue> = all[offset..end_row].iter().map(|p| value_pair(p)).collect();
 
     Ok(Json(json!({
         "metric": p.metric,
         "columns": ["timestamp", "value"],
         "rows": rows,
-        "row_count": row_count,
+        "row_count": rows.len(),
+        "offset": offset,
+        "total_rows": total_rows,
+        "sample_size": sample_size,
+        "elapsed_ms": started.elapsed().as_millis(),
+    })))
+}
+
+/// Flat params for the server-side pivot endpoint.
+#[derive(serde::Deserialize)]
+struct PivotParams {
+    metric: String,
+    start: i64,
+    end: Option<i64>,
+    aggregator: Option<String>,
+    sampling_value: Option<i64>,
+    sampling_unit: Option<String>,
+    align_sampling: Option<bool>,
+    tags: Option<String>,
+    /// Tag whose distinct values become the matrix columns.
+    column_tag: String,
+    offset: Option<usize>,
+    limit: Option<usize>,
+}
+
+/// `GET /api/v1/query/pivot` — a server-side pivot: groups by `column_tag` and
+/// returns a matrix where rows are time buckets and columns are the distinct
+/// tag values (e.g. one column per `host`, one row per day). The pivot happens
+/// over the full dataset in the server; Excel just spills the (small) matrix.
+/// Paged the same way as the grid endpoint.
+async fn query_pivot(
+    State(state): State<AppState>,
+    Query(p): Query<PivotParams>,
+) -> Result<Json<JsonValue>, ApiError> {
+    let started = std::time::Instant::now();
+    let end = p.end.unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+
+    let metric = grid_metric_json(
+        &p.metric,
+        &p.aggregator,
+        p.sampling_value,
+        &p.sampling_unit,
+        p.align_sampling,
+        &p.tags,
+        Some(&p.column_tag),
+    );
+    let mq: MetricQuery = serde_json::from_value(metric)
+        .map_err(|e| bad_request(format!("invalid pivot query: {e}")))?;
+
+    crate::metrics::inc(&crate::metrics::QUERIES);
+    let (sample_size, groups, _saved) = run_metric_query(
+        &state.store,
+        &mq,
+        p.start,
+        end,
+        kairos_core::time::UTC,
+        state.fast_math,
+        state.guard.max_points,
+    )
+    .await
+    .map_err(bad_request)?;
+    crate::metrics::add(&crate::metrics::QUERY_SAMPLE_POINTS, sample_size as u64);
+
+    // Column labels = the distinct values of `column_tag`, sorted.
+    let mut columns: Vec<String> = groups
+        .iter()
+        .map(|g| g.group.get(&p.column_tag).cloned().unwrap_or_default())
+        .collect();
+    columns.sort();
+    columns.dedup();
+    let col_index: std::collections::HashMap<&str, usize> =
+        columns.iter().enumerate().map(|(i, c)| (c.as_str(), i)).collect();
+
+    // Union of timestamps -> a row per bucket, one cell per column.
+    let mut matrix: std::collections::BTreeMap<i64, Vec<Option<f64>>> = Default::default();
+    for g in &groups {
+        let label = g.group.get(&p.column_tag).map(String::as_str).unwrap_or("");
+        let Some(&ci) = col_index.get(label) else { continue };
+        for pt in &g.points {
+            matrix
+                .entry(pt.timestamp_ms)
+                .or_insert_with(|| vec![None; columns.len()])[ci] = pt.value.as_f64();
+        }
+    }
+
+    let total_rows = matrix.len();
+    let offset = p.offset.unwrap_or(0).min(total_rows);
+    let end_row = p.limit.map_or(total_rows, |n| (offset + n).min(total_rows));
+    let rows: Vec<JsonValue> = matrix
+        .into_iter()
+        .skip(offset)
+        .take(end_row - offset)
+        .map(|(ts, cells)| {
+            let mut row = vec![json!(ts)];
+            row.extend(cells.into_iter().map(|c| c.map_or(JsonValue::Null, |v| json!(v))));
+            JsonValue::Array(row)
+        })
+        .collect();
+
+    let mut header = vec![json!("timestamp")];
+    header.extend(columns.iter().map(|c| json!(c)));
+
+    Ok(Json(json!({
+        "metric": p.metric,
+        "column_tag": p.column_tag,
+        "columns": header,
+        "rows": rows,
+        "row_count": rows.len(),
+        "offset": offset,
+        "total_rows": total_rows,
         "sample_size": sample_size,
         "elapsed_ms": started.elapsed().as_millis(),
     })))
@@ -787,8 +920,65 @@ mod tests {
         assert_eq!(body["columns"], json!(["timestamp", "value"]));
         assert_eq!(body["rows"], json!([[1000, 15.0], [121000, 30.0]]));
         assert_eq!(body["row_count"], 2);
+        assert_eq!(body["total_rows"], 2);
         assert_eq!(body["sample_size"], 3); // three raw points were scanned
         assert!(body["elapsed_ms"].is_number());
+    }
+
+    #[tokio::test]
+    async fn grid_paging_is_a_viewport_over_total_rows() {
+        let app = memory_router().await;
+        // 10 raw points; page a 3-row window through them.
+        let pts: Vec<JsonValue> = (0..10).map(|i| json!([i * 1000, i as f64])).collect();
+        send(
+            &app,
+            "POST",
+            "/api/v1/datapoints",
+            json!([{"name": "page.m", "tags": {"h": "a"}, "datapoints": pts}]),
+        )
+        .await;
+        settle().await;
+
+        let (status, body) = send(
+            &app,
+            "GET",
+            "/api/v1/query/grid?metric=page.m&start=0&end=100000&offset=3&limit=3",
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["total_rows"], 10, "viewport reports the full size");
+        assert_eq!(body["offset"], 3);
+        assert_eq!(body["rows"], json!([[3000, 3.0], [4000, 4.0], [5000, 5.0]]));
+    }
+
+    #[tokio::test]
+    async fn pivot_returns_a_time_by_tag_matrix() {
+        let app = memory_router().await;
+        send(
+            &app,
+            "POST",
+            "/api/v1/datapoints",
+            json!([
+                {"name": "pv.m", "tags": {"host": "a"}, "datapoints": [[0, 1.0], [3600000, 2.0]]},
+                {"name": "pv.m", "tags": {"host": "b"}, "datapoints": [[0, 10.0], [3600000, 20.0]]}
+            ]),
+        )
+        .await;
+        settle().await;
+
+        let (status, body) = send(
+            &app,
+            "GET",
+            "/api/v1/query/pivot?metric=pv.m&start=0&end=10000000&aggregator=avg&sampling_value=1&sampling_unit=hours&align_sampling=false&column_tag=host",
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // columns: [timestamp, a, b]; one row per hour bucket, a cell per host.
+        assert_eq!(body["columns"], json!(["timestamp", "a", "b"]));
+        assert_eq!(body["rows"], json!([[0, 1.0, 10.0], [3600000, 2.0, 20.0]]));
+        assert_eq!(body["total_rows"], 2);
     }
 
     #[tokio::test]

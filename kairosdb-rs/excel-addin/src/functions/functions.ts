@@ -206,7 +206,89 @@ export function stream(
   invocation.onCanceled = () => clearInterval(timer);
 }
 
+/**
+ * A scrollable viewport: returns `pageSize` rows of the aggregated result
+ * starting at `offset`. Bind `offset` to a scrollbar form control to scroll a
+ * window over a result far larger than the grid can hold.
+ * @customfunction
+ * @param metric Metric name.
+ * @param start Start time.
+ * @param end End time.
+ * @param offset First row of the window (0-based).
+ * @param pageSize Number of rows to show.
+ * @param aggregator Optional aggregator.
+ * @param sampling Optional bucket size like "1d".
+ * @param tags Optional tag filter.
+ * @param url Optional kairosd base URL.
+ * @returns A windowed [date, value] range.
+ */
+export async function page(
+  metric: string,
+  start: number | string | Date,
+  end: number | string | Date,
+  offset: number,
+  pageSize: number,
+  aggregator?: string,
+  sampling?: string,
+  tags?: string,
+  url?: string
+): Promise<(number | string)[][]> {
+  const params = buildParams(metric, start, end, aggregator, sampling, tags);
+  params.offset = String(Math.max(0, Math.round(offset)));
+  params.limit = String(Math.max(1, Math.round(pageSize)));
+  const r = await gridFetch(url || DEFAULT_URL, params);
+  if (!r.rows || r.rows.length === 0) return [["(no data)", ""]];
+  return r.rows.map((row) => [epochMsToSerial(Number(row[0])), row[1]]);
+}
+
+interface PivotResponse {
+  columns: string[];
+  rows: (number | string | null)[][];
+}
+
+/**
+ * Server-side pivot: one column per distinct value of `columnTag`, one row per
+ * time bucket. The pivot runs over the full dataset in kairosd; only the matrix
+ * spills into Excel. The first returned row is the column header.
+ * @customfunction
+ * @param metric Metric name.
+ * @param start Start time.
+ * @param end End time.
+ * @param columnTag Tag whose values become columns (e.g. "host").
+ * @param aggregator Optional aggregator (e.g. avg). Omit for raw points.
+ * @param sampling Optional bucket size like "1d".
+ * @param tags Optional extra tag filter.
+ * @param url Optional kairosd base URL.
+ * @returns A header row followed by a [date, ...values] matrix.
+ */
+export async function pivot(
+  metric: string,
+  start: number | string | Date,
+  end: number | string | Date,
+  columnTag: string,
+  aggregator?: string,
+  sampling?: string,
+  tags?: string,
+  url?: string
+): Promise<(number | string)[][]> {
+  const params = buildParams(metric, start, end, aggregator, sampling, tags);
+  params.column_tag = columnTag;
+  const qs = new URLSearchParams(params).toString();
+  const res = await fetch(`${url || DEFAULT_URL}/api/v1/query/pivot?${qs}`);
+  if (!res.ok) throw new Error(`kairosd ${res.status}: ${await res.text()}`);
+  const r = (await res.json()) as PivotResponse;
+  if (!r.rows || r.rows.length === 0) return [["(no data)"]];
+  const header: (number | string)[] = r.columns.map((c) => (c === "timestamp" ? "Time" : c));
+  const data: (number | string)[][] = r.rows.map((row) => [
+    epochMsToSerial(Number(row[0])),
+    ...row.slice(1).map((v) => (v === null ? "" : (v as number | string))),
+  ]);
+  return [header, ...data];
+}
+
 CustomFunctions.associate("QUERY", query);
 CustomFunctions.associate("INFO", info);
 CustomFunctions.associate("METRICS", metrics);
 CustomFunctions.associate("STREAM", stream);
+CustomFunctions.associate("PAGE", page);
+CustomFunctions.associate("PIVOT", pivot);

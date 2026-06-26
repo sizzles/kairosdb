@@ -17,6 +17,9 @@ back. The status line `=KAIROS.INFO(...)` shows the headline:
 | Function | Result |
 |---|---|
 | `=KAIROS.QUERY(metric, start, end, [agg], [bucket], [tags], [url])` | Spills `[date, value]` rows for the aggregated series |
+| `=KAIROS.PAGE(metric, start, end, offset, pageSize, [agg], [bucket], [tags], [url])` | A scrollable **viewport**: `pageSize` rows from `offset` |
+| `=KAIROS.PIVOT(metric, start, end, columnTag, [agg], [bucket], [tags], [url])` | Server-side **pivot**: time × distinct-tag-value matrix (header + rows) |
+| `=KAIROS.STREAM(metric, windowSeconds, [agg], [bucket], [tags], [interval], [url])` | **Live** trailing window; re-spills each `interval` (polling) |
 | `=KAIROS.INFO(metric, start, end, [agg], [bucket], [tags], [url])` | `"aggregated N points into R rows in X ms"` |
 | `=KAIROS.METRICS([prefix], [url])` | Spills a column of metric names |
 
@@ -27,15 +30,39 @@ back. The status line `=KAIROS.INFO(...)` shows the headline:
 - `url`: optional `kairosd` base URL (default `http://localhost:8080`).
 - Format the timestamp column as **Date/Time** (the function returns Excel date serials).
 
+## Scrollable viewport + pivot
+
+Excel's grid can't hold a billion rows, but you can make a fixed-size window
+that's a **viewport** onto a much larger server-side result:
+
+- **Scroll.** Put the row offset in a cell (say `E1`) and use
+  `=KAIROS.PAGE(B1, B2, B3, E1, 100, "avg", B4)` — it always spills 100 rows
+  starting at `E1`. Add a **scrollbar form control** (Developer ▸ Insert ▸
+  Scroll Bar) and set its *Cell link* to `E1`, with *Max* = the result's
+  `total_rows`. Drag the scrollbar and the window pages through the result —
+  it feels like scrolling a giant table through a small window. (It's not
+  Excel's native grid scrollbar over a million rows — those rows never enter
+  the grid — it's a control that drives server-side paging.)
+- **Pivot.** `=KAIROS.PIVOT(B1, B2, B3, "host", "avg", "1d")` returns a matrix
+  — one row per time bucket, one column per distinct `host`, with a header
+  row — computed entirely in `kairosd`. You're pivoting the *whole* dataset
+  server-side and spilling only the (small) result, not pulling a billion
+  points into Excel to pivot locally.
+
+> If you instead want Excel's *native* PivotTables over tens of millions of
+> rows, load a slice via Power Query into the Data Model (VertiPaq) — a
+> separate, also-valid path that leans on Excel's own columnar engine.
+
 ## What's verified vs. not
 
 This repo's CI cannot run Excel, so:
 
-- ✅ **Server side** (`kairosd`): the `GET /api/v1/query/grid` endpoint and CORS
-  are implemented and unit-tested in the Rust workspace.
+- ✅ **Server side** (`kairosd`): the `query/grid` (paged) and `query/pivot`
+  endpoints and CORS are implemented and unit-tested in the Rust workspace.
 - ✅ **Function logic** (`src/functions/functions.ts`): exercised end-to-end
   against a live `kairosd` (date conversion → URL → fetch → response shaping)
-  — `query`, `info`, `metrics`, and tag filtering all confirmed.
+  — `query`, `page` (viewport paging), `pivot` (matrix), `info`, `metrics`,
+  and tag filtering all confirmed. `stream` reuses the same verified path.
 - ⚠️ **Excel runtime glue** (`manifest.xml`, webpack build, custom-functions
   registration): standard Office tooling that was **not run here**. If the
   manifest doesn't validate in your Office build, use the generator path below
