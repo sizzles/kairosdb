@@ -151,6 +151,62 @@ export async function metrics(prefix?: string, url?: string): Promise<string[][]
   return names.length ? names.map((n) => [n]) : [["(no metrics)"]];
 }
 
+/** One streaming tick: query the trailing `windowSeconds` ending now. */
+async function streamTick(
+  base: string,
+  metric: string,
+  windowSeconds: number,
+  aggregator?: string,
+  sampling?: string,
+  tags?: string
+): Promise<(number | string)[][]> {
+  const end = Date.now();
+  const start = end - windowSeconds * 1000;
+  const r = await gridFetch(base, buildParams(metric, start, end, aggregator, sampling, tags));
+  if (!r.rows || r.rows.length === 0) return [["(no data)", ""]];
+  return r.rows.map((row) => [epochMsToSerial(Number(row[0])), row[1]]);
+}
+
+/**
+ * Live, scrolling view of a trailing time window. Re-queries every
+ * `intervalSeconds` and re-spills `[date, value]` rows, so the window slides
+ * forward as new data arrives. Polling, not push: `kairosd` is re-queried each
+ * tick.
+ * @customfunction
+ * @param metric Metric name.
+ * @param windowSeconds Width of the trailing window to show.
+ * @param aggregator Optional aggregator (e.g. avg). Omit for raw points.
+ * @param sampling Optional bucket size like "1s", "10s".
+ * @param tags Optional tag filter.
+ * @param intervalSeconds Refresh cadence (default 1).
+ * @param url Optional kairosd base URL.
+ * @param invocation Streaming handle (supplied by Excel).
+ * @returns A live-updating two-column range.
+ * @streaming
+ */
+export function stream(
+  metric: string,
+  windowSeconds: number,
+  aggregator: string,
+  sampling: string,
+  tags: string,
+  intervalSeconds: number,
+  url: string,
+  invocation: CustomFunctions.StreamingInvocation<(number | string)[][]>
+): void {
+  const base = url || DEFAULT_URL;
+  const every = Math.max(1, Math.round(intervalSeconds || 1)) * 1000;
+  const tick = () => {
+    streamTick(base, metric, windowSeconds, aggregator, sampling, tags)
+      .then((rows) => invocation.setResult(rows))
+      .catch((e) => invocation.setResult([["error", String(e)]]));
+  };
+  tick();
+  const timer = setInterval(tick, every);
+  invocation.onCanceled = () => clearInterval(timer);
+}
+
 CustomFunctions.associate("QUERY", query);
 CustomFunctions.associate("INFO", info);
 CustomFunctions.associate("METRICS", metrics);
+CustomFunctions.associate("STREAM", stream);
